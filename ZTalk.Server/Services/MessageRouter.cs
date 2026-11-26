@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Linq;
-using System.Text;
+using System.Collections.Generic;
 using ZTalk.Server.Models;
 using ZTalk.Shared.Protocol;
 
@@ -22,16 +21,18 @@ namespace ZTalk.Server.Services
         }
 
         /// <summary>
-        /// Sends packet to a specific client
+        /// Sends packet to a specific client (serialized per client socket)
         /// </summary>
         public void SendToClient(string userId, Packet packet)
         {
+            if (string.IsNullOrEmpty(userId) || packet == null) return;
+
             ConnectedClient client;
             if (_clients.TryGetValue(userId, out client) && client.IsAuthenticated)
             {
                 try
                 {
-                    PacketSerializer.SendPacket(client.Stream, packet);
+                    client.SendPacket(packet);
                 }
                 catch (Exception ex)
                 {
@@ -41,10 +42,14 @@ namespace ZTalk.Server.Services
         }
 
         /// <summary>
-        /// Broadcasts packet to all connected clients (except excluded user)
+        /// Broadcasts packet to all connected clients (except excluded user).
+        /// Serializes and frames packet once to avoid N× JSON/UTF-8 allocation overhead.
         /// </summary>
         public void Broadcast(Packet packet, string excludeUserId = null)
         {
+            if (packet == null) return;
+
+            byte[] frame = PacketSerializer.FramePacket(packet);
             foreach (var kvp in _clients)
             {
                 if (kvp.Key == excludeUserId) continue;
@@ -52,7 +57,7 @@ namespace ZTalk.Server.Services
 
                 try
                 {
-                    PacketSerializer.SendPacket(kvp.Value.Stream, packet);
+                    kvp.Value.SendRawFrame(frame);
                 }
                 catch (Exception ex)
                 {
@@ -67,14 +72,42 @@ namespace ZTalk.Server.Services
         /// </summary>
         public void BroadcastUserList()
         {
-            var onlineUsers = _clients.Values
-                .Where(c => c.IsAuthenticated)
-                .Select(c => c.UserId + "|" + c.DisplayName);
+            var packet = BuildUserListPacket();
+            Broadcast(packet);
+        }
+
+        /// <summary>
+        /// Sends online user list only to the requesting client (avoids O(N²) Heartbeat amplification).
+        /// </summary>
+        public void SendUserListToClient(ConnectedClient client)
+        {
+            if (client == null || !client.IsAuthenticated) return;
+
+            try
+            {
+                var packet = BuildUserListPacket();
+                client.SendPacket(packet);
+            }
+            catch (Exception ex)
+            {
+                _log?.Invoke($"[ERROR] Failed to send user list to {client.UserId}: {ex.Message}");
+            }
+        }
+
+        private Packet BuildUserListPacket()
+        {
+            var onlineUsers = new List<string>();
+            foreach (var kvp in _clients)
+            {
+                var c = kvp.Value;
+                if (c.IsAuthenticated)
+                {
+                    onlineUsers.Add(c.UserId + "|" + c.DisplayName);
+                }
+            }
 
             var userListData = string.Join(",", onlineUsers);
-            var packet = new Packet(PacketType.UserList, "server", null, userListData);
-
-            Broadcast(packet);
+            return new Packet(PacketType.UserList, "server", null, userListData);
         }
     }
 }

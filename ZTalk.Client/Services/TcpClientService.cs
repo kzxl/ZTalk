@@ -8,16 +8,17 @@ namespace ZTalk.Client.Services
 {
     /// <summary>
     /// Quản lý TCP connection đến server.
-    /// Nhận packet trong background thread, gửi packet thread-safe.
+    /// Nhận packet bằng async IOCP, gửi packet thread-safe.
     /// </summary>
-    public class TcpClientService : ITcpClientService
+    public class TcpClientService : ITcpClientService, IDisposable
     {
         private TcpClient _client;
         private NetworkStream _stream;
         private CancellationTokenSource _cts;
         private readonly object _sendLock = new object();
+        private int _connectedFlag;
 
-        public bool IsConnected { get; private set; }
+        public bool IsConnected => Volatile.Read(ref _connectedFlag) == 1;
 
         public event Action<Packet> OnPacketReceived;
         public event Action OnDisconnected;
@@ -27,21 +28,28 @@ namespace ZTalk.Client.Services
         /// </summary>
         public async Task<bool> ConnectAsync(string host, int port)
         {
+            // Clean up any previous connection before reconnecting
+            CloseConnectionQuietly();
+
             try
             {
-                _client = new TcpClient();
-                await _client.ConnectAsync(host, port);
-                _stream = _client.GetStream();
-                IsConnected = true;
+                var client = new TcpClient { NoDelay = true };
+                await client.ConnectAsync(host, port).ConfigureAwait(false);
+                var stream = client.GetStream();
 
+                _client = client;
+                _stream = stream;
                 _cts = new CancellationTokenSource();
-                var _ = Task.Run(() => ReceiveLoopAsync(_cts.Token));
+                Interlocked.Exchange(ref _connectedFlag, 1);
+
+                var ct = _cts.Token;
+                var _ = Task.Run(() => ReceiveLoopAsync(stream, ct));
 
                 return true;
             }
             catch
             {
-                IsConnected = false;
+                CloseConnectionQuietly();
                 return false;
             }
         }
@@ -51,11 +59,8 @@ namespace ZTalk.Client.Services
         /// </summary>
         public void Disconnect()
         {
-            IsConnected = false;
-            _cts?.Cancel();
-
-            try { _stream?.Close(); } catch { }
-            try { _client?.Close(); } catch { }
+            Interlocked.Exchange(ref _connectedFlag, 0);
+            CloseConnectionQuietly();
         }
 
         /// <summary>
@@ -63,37 +68,50 @@ namespace ZTalk.Client.Services
         /// </summary>
         public void SendPacket(Packet packet)
         {
-            if (!IsConnected || _stream == null) return;
+            if (!IsConnected || packet == null) return;
 
+            bool disconnectedNow = false;
             lock (_sendLock)
             {
+                var stream = _stream;
+                if (!IsConnected || stream == null) return;
+
                 try
                 {
-                    PacketSerializer.SendPacket(_stream, packet);
+                    PacketSerializer.SendPacket(stream, packet);
                 }
                 catch
                 {
-                    IsConnected = false;
-                    OnDisconnected?.Invoke();
+                    disconnectedNow = Interlocked.Exchange(ref _connectedFlag, 0) == 1;
                 }
+            }
+
+            if (disconnectedNow)
+            {
+                CloseConnectionQuietly();
+                OnDisconnected?.Invoke();
             }
         }
 
         /// <summary>
-        /// Vòng lặp nhận packet từ server
+        /// Vòng lặp nhận packet bất đồng bộ từ server (không spawn Task.Run cho từng packet)
         /// </summary>
-        private async Task ReceiveLoopAsync(CancellationToken ct)
+        private async Task ReceiveLoopAsync(NetworkStream stream, CancellationToken ct)
         {
             try
             {
                 while (!ct.IsCancellationRequested && IsConnected)
                 {
-                    var packet = await Task.Run(() => PacketSerializer.ReceivePacket(_stream));
+                    var packet = await PacketSerializer.ReceivePacketAsync(stream, ct).ConfigureAwait(false);
                     if (packet == null)
                         break;
 
                     OnPacketReceived?.Invoke(packet);
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // Clean disconnect
             }
             catch
             {
@@ -101,12 +119,33 @@ namespace ZTalk.Client.Services
             }
             finally
             {
-                if (IsConnected)
+                if (Interlocked.Exchange(ref _connectedFlag, 0) == 1)
                 {
-                    IsConnected = false;
+                    CloseConnectionQuietly();
                     OnDisconnected?.Invoke();
                 }
             }
+        }
+
+        private void CloseConnectionQuietly()
+        {
+            var cts = Interlocked.Exchange(ref _cts, null);
+            if (cts != null)
+            {
+                try { cts.Cancel(); } catch { }
+                try { cts.Dispose(); } catch { }
+            }
+
+            var stream = Interlocked.Exchange(ref _stream, null);
+            try { stream?.Close(); } catch { }
+
+            var client = Interlocked.Exchange(ref _client, null);
+            try { client?.Close(); } catch { }
+        }
+
+        public void Dispose()
+        {
+            Disconnect();
         }
     }
 }

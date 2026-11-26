@@ -41,7 +41,7 @@ namespace ZTalk.Client.Forms
 
         private void DisplayRemoteFrame(byte[] frameData)
         {
-            if (_isFormClosing || IsDisposed) return;
+            if (_isFormClosing || IsDisposed || !IsHandleCreated) return;
 
             if (InvokeRequired)
             {
@@ -56,16 +56,16 @@ namespace ZTalk.Client.Forms
             try
             {
                 using (var ms = new MemoryStream(frameData))
+                using (var image = Image.FromStream(ms))
                 {
-                    var image = Image.FromStream(ms);
                     var oldImg = pnlRemoteVideo.Image;
                     pnlRemoteVideo.Image = new Bitmap(image);
                     oldImg?.Dispose();
+                }
 
-                    if (_isRecording)
-                    {
-                        _recorder.AddFrame(frameData);
-                    }
+                if (_isRecording)
+                {
+                    _recorder.AddFrame(frameData);
                 }
             }
             catch { }
@@ -73,7 +73,7 @@ namespace ZTalk.Client.Forms
 
         private void DisplayLocalFrame(byte[] frameData)
         {
-            if (_isFormClosing || IsDisposed) return;
+            if (_isFormClosing || IsDisposed || !IsHandleCreated) return;
 
             if (InvokeRequired)
             {
@@ -88,8 +88,8 @@ namespace ZTalk.Client.Forms
             try
             {
                 using (var ms = new MemoryStream(frameData))
+                using (var image = Image.FromStream(ms))
                 {
-                    var image = Image.FromStream(ms);
                     var oldImg = pnlLocalVideo.Image;
                     pnlLocalVideo.Image = new Bitmap(image);
                     oldImg?.Dispose();
@@ -227,11 +227,17 @@ namespace ZTalk.Client.Forms
             _videoCallService.OnLocalFrameCaptured -= DisplayLocalFrame;
             _videoCallService.OnCallEnded -= HandleCallEnded;
 
+            if (_videoCallService.IsInCall)
+            {
+                _videoCallService.EndCall();
+            }
+
             if (_isRecording)
             {
                 _recorder.StopRecording();
                 _isRecording = false;
             }
+            _recorder.Dispose();
 
             pnlRemoteVideo.Image?.Dispose();
             pnlRemoteVideo.Image = null;

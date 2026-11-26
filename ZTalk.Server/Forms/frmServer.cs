@@ -1,6 +1,7 @@
 ﻿using System;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using ZTalk.Server.Data;
 using ZTalk.Server.Services;
@@ -13,9 +14,12 @@ namespace ZTalk.Server.Forms
     /// </summary>
     public partial class frmServer : Form
     {
-        private TcpServerService _serverService;
-        private UserStore _userStore;
+        private const int MaxLogChars = 60000;
+
+        private readonly TcpServerService _serverService;
+        private readonly UserStore _userStore;
         private readonly bool _autoStart;
+        private readonly string _cachedLocalIp;
 
         public frmServer(bool autoStart = false)
         {
@@ -28,14 +32,14 @@ namespace ZTalk.Server.Forms
             _serverService.OnLog += AppendLog;
             _serverService.OnClientListChanged += RefreshClientList;
 
-            // Display local IP upon startup
-            string localIp = StunClient.GetLocalIPAddress()?.ToString() ?? "127.0.0.1";
-            lblStats.Text = $"⏱ Uptime: --:--:-- | 📦 Routed Packets: 0 | 🌐 Local IP: {localIp}:{(int)nudPort.Value}";
+            // Cache local IP once instead of creating a UDP socket every second in tmrStats_Tick
+            _cachedLocalIp = StunClient.GetLocalIPAddress()?.ToString() ?? "127.0.0.1";
+            lblStats.Text = $"⏱ Uptime: --:--:-- | 📦 Routed Packets: 0 | 🌐 Local IP: {_cachedLocalIp}:{(int)nudPort.Value}";
         }
 
-        protected override void OnLoad(EventArgs e)
+        protected override void OnShown(EventArgs e)
         {
-            base.OnLoad(e);
+            base.OnShown(e);
             if (_autoStart)
             {
                 btnStart_Click(this, EventArgs.Empty);
@@ -80,10 +84,24 @@ namespace ZTalk.Server.Forms
 
         private void AppendLog(string message)
         {
+            if (IsDisposed || Disposing || !IsHandleCreated) return;
+
             if (txtLog.InvokeRequired)
             {
-                txtLog.BeginInvoke(new Action<string>(AppendLog), message);
+                try
+                {
+                    txtLog.BeginInvoke(new Action<string>(AppendLog), message);
+                }
+                catch (ObjectDisposedException) { }
+                catch (InvalidOperationException) { }
                 return;
+            }
+
+            // Cap log buffer to avoid unbounded UI memory growth on long-running server
+            if (txtLog.TextLength > MaxLogChars)
+            {
+                txtLog.Select(0, txtLog.TextLength / 2);
+                txtLog.SelectedText = string.Empty;
             }
 
             txtLog.AppendText(message + Environment.NewLine);
@@ -92,34 +110,51 @@ namespace ZTalk.Server.Forms
 
         private void RefreshClientList()
         {
+            if (IsDisposed || Disposing || !IsHandleCreated) return;
+
             if (lvClients.InvokeRequired)
             {
-                lvClients.BeginInvoke(new Action(RefreshClientList));
+                try
+                {
+                    lvClients.BeginInvoke(new Action(RefreshClientList));
+                }
+                catch (ObjectDisposedException) { }
+                catch (InvalidOperationException) { }
                 return;
             }
 
             lvClients.BeginUpdate();
-            lvClients.Items.Clear();
-
-            var clients = _serverService.GetClientsSnapshot();
-            foreach (var client in clients)
+            try
             {
-                var item = new ListViewItem(client.IsAuthenticated ? "🟢 Online" : "🟡 Connecting");
-                item.Tag = client.UserId;
-                item.SubItems.Add(client.Username ?? client.UserId);
-                item.SubItems.Add(client.DisplayName ?? "-");
-                item.SubItems.Add(client.EndPoint);
-                item.SubItems.Add(client.ConnectedAt.ToString("HH:mm:ss"));
-                item.SubItems.Add($"{client.PacketsReceived} / {client.PacketsSent}");
+                lvClients.Items.Clear();
 
-                if (!client.IsAuthenticated)
-                    item.ForeColor = System.Drawing.Color.Gold;
+                var clients = _serverService.GetClientsSnapshot();
+                int authenticatedCount = 0;
 
-                lvClients.Items.Add(item);
+                foreach (var client in clients)
+                {
+                    if (client.IsAuthenticated) authenticatedCount++;
+
+                    var item = new ListViewItem(client.IsAuthenticated ? "🟢 Online" : "🟡 Connecting");
+                    item.Tag = client.UserId;
+                    item.SubItems.Add(client.Username ?? client.UserId);
+                    item.SubItems.Add(client.DisplayName ?? "-");
+                    item.SubItems.Add(client.EndPoint);
+                    item.SubItems.Add(client.ConnectedAt.ToString("HH:mm:ss"));
+                    item.SubItems.Add($"{client.PacketsReceived} / {client.PacketsSent}");
+
+                    if (!client.IsAuthenticated)
+                        item.ForeColor = System.Drawing.Color.Gold;
+
+                    lvClients.Items.Add(item);
+                }
+
+                lblClients.Text = $"📡 Clients Online ({authenticatedCount})";
             }
-            lvClients.EndUpdate();
-
-            lblClients.Text = $"📡 Clients Online ({clients.Count(c => c.IsAuthenticated)})";
+            finally
+            {
+                lvClients.EndUpdate();
+            }
         }
 
         private void tsmiKick_Click(object sender, EventArgs e)
@@ -154,37 +189,45 @@ namespace ZTalk.Server.Forms
             txtLog.Clear();
         }
 
-        private void btnLaunchClients_Click(object sender, EventArgs e)
+        private async void btnLaunchClients_Click(object sender, EventArgs e)
         {
             try
             {
-                string clientExe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ZTalk.Client.exe");
-                if (!File.Exists(clientExe))
+                string clientExe = ResolveClientExePath();
+                if (clientExe == null)
                 {
-                    clientExe = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\..\..\ZTalk.Client\bin\Debug\ZTalk.Client.exe"));
-                }
-
-                if (!File.Exists(clientExe))
-                {
-                    MessageBox.Show($"ZTalk.Client.exe not found at: {clientExe}\nPlease build the solution first.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show("ZTalk.Client.exe not found. Please build the solution first.",
+                        "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 
                 // Launch Alice
                 System.Diagnostics.Process.Start(clientExe, "demo_alice");
+                AppendLog("[ADMIN] Dispatched launch command for 2 demo clients (Alice & Bob)");
 
                 // Launch Bob after 400ms
-                System.Threading.Tasks.Task.Delay(400).ContinueWith(_ =>
+                await Task.Delay(400);
+                if (!IsDisposed)
                 {
-                    try { System.Diagnostics.Process.Start(clientExe, "demo_bob"); } catch { }
-                });
-
-                AppendLog("[ADMIN] Dispatched launch command for 2 demo clients (Alice & Bob)");
+                    System.Diagnostics.Process.Start(clientExe, "demo_bob");
+                }
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"Error launching clients: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        private static string ResolveClientExePath()
+        {
+            string[] candidates =
+            {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ZTalk.Client.exe"),
+                Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\..\..\ZTalk.Client\bin\Release\ZTalk.Client.exe")),
+                Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\..\..\ZTalk.Client\bin\Debug\ZTalk.Client.exe"))
+            };
+
+            return candidates.FirstOrDefault(File.Exists);
         }
 
         private void tmrStats_Tick(object sender, EventArgs e)
@@ -193,8 +236,7 @@ namespace ZTalk.Server.Forms
             {
                 var uptime = DateTime.Now - _serverService.StartTime.Value;
                 string uptimeStr = string.Format("{0:D2}:{1:D2}:{2:D2}", (int)uptime.TotalHours, uptime.Minutes, uptime.Seconds);
-                string localIp = StunClient.GetLocalIPAddress()?.ToString() ?? "127.0.0.1";
-                lblStats.Text = $"⏱ Uptime: {uptimeStr} | 📦 Routed Packets: {_serverService.TotalMessagesRouted} | 👥 Connected: {_serverService.ConnectedCount} | 🌐 Local IP: {localIp}:{(int)nudPort.Value}";
+                lblStats.Text = $"⏱ Uptime: {uptimeStr} | 📦 Routed Packets: {_serverService.TotalMessagesRouted} | 👥 Connected: {_serverService.ConnectedCount} | 🌐 Local IP: {_cachedLocalIp}:{(int)nudPort.Value}";
             }
         }
 
@@ -211,10 +253,12 @@ namespace ZTalk.Server.Forms
                     e.Cancel = true;
                     return;
                 }
-
-                tmrStats.Stop();
-                _serverService.Stop();
             }
+
+            tmrStats.Stop();
+            _serverService.OnLog -= AppendLog;
+            _serverService.OnClientListChanged -= RefreshClientList;
+            _serverService.Dispose();
         }
     }
 }

@@ -1,11 +1,13 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Media;
-using System.Text;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using ZTalk.Client.Services;
 using ZTalk.Shared.Crypto;
+using ZTalk.Shared.DTOs;
 using ZTalk.Shared.Protocol;
 
 namespace ZTalk.Client.Forms
@@ -15,6 +17,8 @@ namespace ZTalk.Client.Forms
     /// </summary>
     public partial class frmChat : Form
     {
+        private const int MaxChatChars = 100000;
+
         private readonly TcpClientService _tcpService;
         private readonly ChatService _chatService;
         private readonly FileTransferService _fileTransferService;
@@ -27,12 +31,14 @@ namespace ZTalk.Client.Forms
         private string _selectedUserId;
         private string _selectedUserName;
         private bool _isGroupChatMode;
+        private bool _suppressSelectionEvent;
 
         // Diffie-Hellman management per peer: TargetUserId -> DH helper
         private readonly Dictionary<string, DiffieHellmanHelper> _dhInstances = new Dictionary<string, DiffieHellmanHelper>();
 
         // Online user list: UserId -> DisplayName
         private readonly Dictionary<string, string> _onlineUsers = new Dictionary<string, string>();
+        private readonly List<string> _onlineUserOrder = new List<string>();
 
         // Unread message badge: UserId -> count
         private readonly Dictionary<string, int> _unreadCounts = new Dictionary<string, int>();
@@ -40,9 +46,13 @@ namespace ZTalk.Client.Forms
         // Active video call form instance
         private frmVideoCall _activeVideoCallForm;
 
+        // Cached emoji picker popup (avoids leaking ContextMenuStrip + 18 Fonts per click)
+        private ContextMenuStrip _emojiMenu;
+        private Font _emojiFont;
+
         // Typing indicator timers
-        private Timer _typingSendTimer;
-        private Timer _typingDisplayTimer;
+        private readonly Timer _typingSendTimer;
+        private readonly Timer _typingDisplayTimer;
 
         /// <summary>Common emojis</summary>
         private static readonly string[] CommonEmojis = new[]
@@ -68,17 +78,17 @@ namespace ZTalk.Client.Forms
             _videoCallService = new VideoCallService(tcpService, _chatService);
             _historyService = new MessageHistoryService();
 
-            // File transfer progress listeners
+            // File transfer progress listeners (thread-safe UI marshaling via AppendSystem)
             _fileTransferService.OnSendProgress += (fileName, current, total) =>
             {
-                if (current == total || current % 5 == 0)
+                if (total > 0 && (current == total || current % 5 == 0))
                 {
                     AppendSystem($"📤 Sending \"{fileName}\": {current}/{total} chunks ({(current * 100 / total)}%)");
                 }
             };
             _fileReceiveService.OnReceiveProgress += (transferId, current, total) =>
             {
-                if (current == total || current % 5 == 0)
+                if (total > 0 && (current == total || current % 5 == 0))
                 {
                     AppendSystem($"📥 Receiving file: {current}/{total} chunks ({(current * 100 / total)}%)");
                 }
@@ -113,6 +123,24 @@ namespace ZTalk.Client.Forms
             this.Shown += frmChat_Shown;
         }
 
+        private void MarshalToUi(Action action)
+        {
+            if (IsDisposed || Disposing || !IsHandleCreated) return;
+
+            if (InvokeRequired)
+            {
+                try
+                {
+                    BeginInvoke(action);
+                }
+                catch (ObjectDisposedException) { }
+                catch (InvalidOperationException) { }
+                return;
+            }
+
+            action();
+        }
+
         private void frmChat_Shown(object sender, EventArgs e)
         {
             // Send Heartbeat to request online user list from server
@@ -124,11 +152,12 @@ namespace ZTalk.Client.Forms
 
         private void HandlePacket(Packet packet)
         {
-            if (InvokeRequired)
-            {
-                BeginInvoke(new Action<Packet>(HandlePacket), packet);
-                return;
-            }
+            MarshalToUi(() => ProcessPacketOnUi(packet));
+        }
+
+        private void ProcessPacketOnUi(Packet packet)
+        {
+            if (packet == null || IsDisposed) return;
 
             switch (packet.Type)
             {
@@ -184,11 +213,10 @@ namespace ZTalk.Client.Forms
 
         private void HandleUserList(Packet packet)
         {
-            // Preserve selected user before clearing
             string previousSelectedId = _selectedUserId;
 
             _onlineUsers.Clear();
-            lstUsers.Items.Clear();
+            _onlineUserOrder.Clear();
 
             if (!string.IsNullOrEmpty(packet.Data))
             {
@@ -203,8 +231,11 @@ namespace ZTalk.Client.Forms
 
                         if (uid == _currentUserId) continue; // Skip self
 
+                        if (!_onlineUsers.ContainsKey(uid))
+                        {
+                            _onlineUserOrder.Add(uid);
+                        }
                         _onlineUsers[uid] = name;
-                        lstUsers.Items.Add($"🟢 {name}");
                     }
                 }
             }
@@ -216,7 +247,6 @@ namespace ZTalk.Client.Forms
             {
                 AppendSystem($"⚠️ {_selectedUserName ?? previousSelectedId} went offline");
 
-                // End video call if in progress with this user
                 if (_videoCallService.IsInCall && _videoCallService.CurrentCallPartner == previousSelectedId)
                 {
                     _videoCallService.EndCall();
@@ -229,33 +259,16 @@ namespace ZTalk.Client.Forms
                 lblChatWith.Text = "Select a user to start chat";
             }
 
-            // Restore selection if user is still online
-            if (!string.IsNullOrEmpty(previousSelectedId) && _onlineUsers.ContainsKey(previousSelectedId))
-            {
-                int idx = 0;
-                foreach (var kvp in _onlineUsers)
-                {
-                    if (kvp.Key == previousSelectedId)
-                    {
-                        lstUsers.SelectedIndex = idx;
-                        break;
-                    }
-                    idx++;
-                }
-            }
+            RefreshUserListBadges(preserveSelection: true);
         }
 
         private void HandleMessage(Packet packet)
         {
-            string content = GetJsonField(packet.Data, "Content");
-            bool isEncrypted = GetJsonField(packet.Data, "IsEncrypted") == "true";
+            var msgDto = PacketSerializer.FromJson<MessageDTO>(packet.Data);
+            if (msgDto == null) return;
 
-            // Decrypt if necessary
-            string displayContent = _chatService.DecryptMessage(packet.SenderId, content, isEncrypted);
-
-            string senderName = "Unknown";
-            if (_onlineUsers.ContainsKey(packet.SenderId))
-                senderName = _onlineUsers[packet.SenderId];
+            string displayContent = _chatService.DecryptMessage(packet.SenderId, msgDto.Content, msgDto.IsEncrypted);
+            string senderName = GetUserName(packet.SenderId);
 
             AppendChat(senderName, displayContent, Color.FromArgb(100, 200, 255));
             PlayNotificationSound();
@@ -266,7 +279,7 @@ namespace ZTalk.Client.Forms
                 int count;
                 _unreadCounts.TryGetValue(packet.SenderId, out count);
                 _unreadCounts[packet.SenderId] = count + 1;
-                RefreshUserListBadges();
+                RefreshUserListBadges(preserveSelection: true);
             }
 
             // Save history
@@ -275,14 +288,13 @@ namespace ZTalk.Client.Forms
 
         private void HandleKeyExchange(Packet packet)
         {
-            // Received public key -> generate DH instance, derive shared secret, send back our public key
             var otherPublicKey = packet.Data;
             var dh = new DiffieHellmanHelper();
             var sharedSecret = dh.DeriveSharedSecret(otherPublicKey);
             var myPublicKey = dh.GetPublicKey();
 
             _chatService.SetSharedKey(packet.SenderId, sharedSecret);
-            _dhInstances[packet.SenderId] = dh;
+            SetDhInstance(packet.SenderId, dh);
 
             // Send public key response
             var responsePacket = new Packet(PacketType.KeyExchangeResponse, _currentUserId, packet.SenderId, myPublicKey);
@@ -293,7 +305,6 @@ namespace ZTalk.Client.Forms
 
         private void HandleKeyExchangeResponse(Packet packet)
         {
-            // Received public key response -> derive shared secret
             DiffieHellmanHelper dh;
             if (_dhInstances.TryGetValue(packet.SenderId, out dh))
             {
@@ -304,41 +315,58 @@ namespace ZTalk.Client.Forms
             }
         }
 
+        private void SetDhInstance(string peerId, DiffieHellmanHelper newDh)
+        {
+            DiffieHellmanHelper oldDh;
+            if (_dhInstances.TryGetValue(peerId, out oldDh) && !ReferenceEquals(oldDh, newDh))
+            {
+                oldDh.Dispose();
+            }
+            _dhInstances[peerId] = newDh;
+        }
+
         private void HandleFileHeader(Packet packet)
         {
-            string fileName = GetJsonField(packet.Data, "FileName");
-            string fileSizeStr = GetJsonField(packet.Data, "FileSize");
-            string totalChunksStr = GetJsonField(packet.Data, "TotalChunks");
-            string transferId = GetJsonField(packet.Data, "TransferId");
+            var dto = PacketSerializer.FromJson<FileTransferDTO>(packet.Data);
+            if (dto == null) return;
+
             string senderName = GetUserName(packet.SenderId);
+            _fileReceiveService.HandleFileHeader(packet.SenderId, senderName, dto.FileName, dto.FileSize, dto.TotalChunks, dto.TransferId);
 
-            long fileSize = 0;
-            long.TryParse(fileSizeStr, out fileSize);
-            int totalChunks = 0;
-            int.TryParse(totalChunksStr, out totalChunks);
-
-            _fileReceiveService.HandleFileHeader(packet.SenderId, senderName, fileName, fileSize, totalChunks, transferId);
-
-            string sizeText = FormatFileSize(fileSize);
-            AppendSystem($"📎 {senderName} is sending file: {fileName} ({sizeText})");
+            string sizeText = FormatFileSize(dto.FileSize);
+            AppendSystem($"📎 {senderName} is sending file: {FileReceiveService.SanitizeFileName(dto.FileName)} ({sizeText})");
         }
 
         private void HandleFileChunk(Packet packet)
         {
-            string transferId = GetJsonField(packet.Data, "TransferId");
-            string chunkIndexStr = GetJsonField(packet.Data, "ChunkIndex");
-            string chunkData = GetJsonField(packet.Data, "ChunkData");
+            var dto = PacketSerializer.FromJson<FileTransferDTO>(packet.Data);
+            if (dto == null || string.IsNullOrEmpty(dto.ChunkData)) return;
 
-            int chunkIndex = 0;
-            int.TryParse(chunkIndexStr, out chunkIndex);
-
-            _fileReceiveService.HandleFileChunk(transferId, chunkIndex, chunkData);
+            if (dto.IsEncrypted)
+            {
+                try
+                {
+                    byte[] encryptedBytes = Convert.FromBase64String(dto.ChunkData);
+                    byte[] decryptedBytes;
+                    if (_chatService.TryDecryptBytes(packet.SenderId, encryptedBytes, out decryptedBytes))
+                    {
+                        _fileReceiveService.HandleFileChunk(dto.TransferId, dto.ChunkIndex, decryptedBytes);
+                    }
+                }
+                catch { }
+            }
+            else
+            {
+                _fileReceiveService.HandleFileChunk(dto.TransferId, dto.ChunkIndex, dto.ChunkData);
+            }
         }
 
         private void HandleFileComplete(Packet packet)
         {
-            string transferId = GetJsonField(packet.Data, "TransferId");
-            string savedPath = _fileReceiveService.HandleFileComplete(transferId);
+            var dto = PacketSerializer.FromJson<FileTransferDTO>(packet.Data);
+            if (dto == null) return;
+
+            string savedPath = _fileReceiveService.HandleFileComplete(dto.TransferId);
 
             if (savedPath != null)
             {
@@ -347,7 +375,7 @@ namespace ZTalk.Client.Forms
 
                 AppendSystem($"✅ Received file from {senderName}: {fileName}");
 
-                string ext = System.IO.Path.GetExtension(savedPath).ToLower();
+                string ext = System.IO.Path.GetExtension(savedPath).ToLowerInvariant();
                 bool isImage = ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".bmp";
 
                 if (isImage)
@@ -394,158 +422,124 @@ namespace ZTalk.Client.Forms
 
         private void HandleGroupMessage(Packet packet)
         {
-            string content = GetJsonField(packet.Data, "Content");
-            string senderName = GetUserName(packet.SenderId);
+            var msgDto = PacketSerializer.FromJson<MessageDTO>(packet.Data);
+            if (msgDto == null) return;
 
-            AppendChat($"[Group] {senderName}", content, Color.FromArgb(255, 180, 100));
+            string senderName = GetUserName(packet.SenderId);
+            AppendChat($"[Group] {senderName}", msgDto.Content, Color.FromArgb(255, 180, 100));
             PlayNotificationSound();
 
             // Save to group history
-            _historyService.SaveMessage("__group__", packet.SenderId, senderName, content, false);
+            _historyService.SaveMessage("__group__", packet.SenderId, senderName, msgDto.Content, false);
         }
 
         private void HandleChatHistoryResponse(Packet packet)
         {
-            // Parse response: {"PartnerId":"xxx","Messages":[...]}
-            string partnerId = GetJsonField(packet.Data, "PartnerId");
-            
-            // Clear "Loading..." text
+            var payload = PacketSerializer.FromJson<Dictionary<string, object>>(packet.Data);
             rtbChat.Clear();
 
-            // Parse Messages array
-            int msgStart = packet.Data.IndexOf("\"Messages\":", StringComparison.Ordinal);
-            if (msgStart < 0) return;
-            msgStart += "\"Messages\":".Length;
-
-            string messagesJson = packet.Data.Substring(msgStart).TrimEnd('}');
-            if (messagesJson == "[]") 
+            if (payload == null)
             {
                 AppendSystem("No message history");
                 return;
             }
 
-            // Parse each message object
-            bool isGroup = partnerId == "__group__";
-            int i = 0;
-            while (i < messagesJson.Length)
+            string partnerId = payload.ContainsKey("PartnerId") ? payload["PartnerId"]?.ToString() : null;
+            var messagesObj = payload.ContainsKey("Messages") ? payload["Messages"] as IEnumerable : null;
+            if (messagesObj == null)
             {
-                int objStart = messagesJson.IndexOf('{', i);
-                if (objStart < 0) break;
+                AppendSystem("No message history");
+                return;
+            }
 
-                int objEnd = FindMatchingBrace(messagesJson, objStart);
-                if (objEnd < 0) break;
+            bool isGroup = partnerId == "__group__";
+            int count = 0;
 
-                string obj = messagesJson.Substring(objStart, objEnd - objStart + 1);
-                string senderId = GetJsonField(obj, "SenderId");
-                string senderName2 = GetJsonField(obj, "SenderName");
-                string content2 = GetJsonField(obj, "Content");
+            foreach (var entry in messagesObj)
+            {
+                var item = entry as Dictionary<string, object>;
+                if (item == null) continue;
+
+                string senderId = item.ContainsKey("SenderId") ? item["SenderId"]?.ToString() : null;
+                string senderName2 = item.ContainsKey("SenderName") ? item["SenderName"]?.ToString() : null;
+                string content2 = item.ContainsKey("Content") ? item["Content"]?.ToString() : null;
 
                 bool isMine = senderId == _currentUserId;
                 var color = isMine ? Color.LimeGreen : (isGroup ? Color.FromArgb(255, 180, 100) : Color.FromArgb(100, 200, 255));
-                var name = isMine ? _currentDisplayName : senderName2;
+                var name = isMine ? _currentDisplayName : (senderName2 ?? senderId ?? "Unknown");
                 if (isGroup && !isMine) name = $"[Group] {name}";
 
-                AppendChat(name, content2, color);
-                i = objEnd + 1;
+                AppendChat(name, content2 ?? "", color);
+                count++;
             }
-        }
 
-        /// <summary>Find matching closing brace, skipping internal nested structures</summary>
-        private int FindMatchingBrace(string s, int openPos)
-        {
-            int depth = 0;
-            bool inString = false;
-            bool escaped = false;
-            for (int i = openPos; i < s.Length; i++)
+            if (count == 0)
             {
-                char c = s[i];
-                if (escaped) { escaped = false; continue; }
-                if (c == '\\') { escaped = true; continue; }
-                if (c == '"') { inString = !inString; continue; }
-                if (inString) continue;
-                if (c == '{') depth++;
-                if (c == '}') { depth--; if (depth == 0) return i; }
+                AppendSystem("No message history");
             }
-            return -1;
         }
 
         private void HandleIncomingCall(string callerUserId)
         {
-            if (InvokeRequired)
+            MarshalToUi(() =>
             {
-                BeginInvoke(new Action<string>(HandleIncomingCall), callerUserId);
-                return;
-            }
+                string callerName = GetUserName(callerUserId);
+                var result = MessageBox.Show(
+                    $"📹 {callerName} is calling you with video.\nDo you want to accept?",
+                    "Incoming Video Call", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
 
-            string callerName = GetUserName(callerUserId);
-            var result = MessageBox.Show(
-                $"📹 {callerName} is calling you with video.\nDo you want to accept?",
-                "Incoming Video Call", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-
-            if (result == DialogResult.Yes)
-            {
-                _videoCallService.AcceptCall(callerUserId);
-            }
-            else
-            {
-                _videoCallService.RejectCall(callerUserId);
-            }
+                if (result == DialogResult.Yes)
+                {
+                    _videoCallService.AcceptCall(callerUserId);
+                }
+                else
+                {
+                    _videoCallService.RejectCall(callerUserId);
+                }
+            });
         }
 
         private void HandleCallAccepted()
         {
-            if (InvokeRequired)
+            MarshalToUi(() =>
             {
-                BeginInvoke(new Action(HandleCallAccepted));
-                return;
-            }
-
-            string partnerName = GetUserName(_videoCallService.CurrentCallPartner);
-            AppendSystem($"📹 Video call connected with {partnerName}");
-            OpenVideoCallForm(partnerName);
+                string partnerName = GetUserName(_videoCallService.CurrentCallPartner);
+                AppendSystem($"📹 Video call connected with {partnerName}");
+                OpenVideoCallForm(partnerName);
+            });
         }
 
         private void HandleCallRejected(string reason)
         {
-            if (InvokeRequired)
+            MarshalToUi(() =>
             {
-                BeginInvoke(new Action<string>(HandleCallRejected), reason);
-                return;
-            }
-
-            AppendSystem($"📹 {reason}");
-            CloseVideoCallForm();
+                AppendSystem($"📹 {reason}");
+                CloseVideoCallForm();
+            });
         }
 
         private void HandleCallEnded()
         {
-            if (InvokeRequired)
+            MarshalToUi(() =>
             {
-                BeginInvoke(new Action(HandleCallEnded));
-                return;
-            }
-
-            AppendSystem("📹 Video call ended");
-            CloseVideoCallForm();
+                AppendSystem("📹 Video call ended");
+                CloseVideoCallForm();
+            });
         }
 
         private void HandleDisconnected()
         {
-            if (InvokeRequired)
+            MarshalToUi(() =>
             {
-                BeginInvoke(new Action(HandleDisconnected));
-                return;
-            }
+                if (_videoCallService.IsInCall)
+                {
+                    _videoCallService.EndCall();
+                    CloseVideoCallForm();
+                }
 
-            // End active call if any
-            if (_videoCallService.IsInCall)
-            {
-                _videoCallService.EndCall();
-                CloseVideoCallForm();
-            }
-
-            AppendSystem("⚠️ Connection to server lost!");
-            MessageBox.Show("Connection to server lost!", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                AppendSystem("⚠️ Connection to server lost!");
+                MessageBox.Show("Connection to server lost!", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            });
         }
 
         #endregion
@@ -554,44 +548,41 @@ namespace ZTalk.Client.Forms
 
         private void lstUsers_SelectedIndexChanged(object sender, EventArgs e)
         {
-            if (lstUsers.SelectedIndex < 0) return;
+            if (_suppressSelectionEvent) return;
+            int selectedIndex = lstUsers.SelectedIndex;
+            if (selectedIndex < 0 || selectedIndex >= _onlineUserOrder.Count) return;
 
-            int idx = 0;
-            foreach (var kvp in _onlineUsers)
+            string userId = _onlineUserOrder[selectedIndex];
+            string displayName = GetUserName(userId);
+
+            // Exit group chat mode when selecting a specific user
+            if (_isGroupChatMode)
             {
-             if (idx == lstUsers.SelectedIndex)
-                {
-                    // Exit group chat mode when selecting a specific user
-                    if (_isGroupChatMode)
-                    {
-                        _isGroupChatMode = false;
-                        btnGroupChat.BackColor = Color.FromArgb(60, 100, 160);
-                        btnGroupChat.Text = "📢 Group Chat";
-                    }
+                _isGroupChatMode = false;
+                btnGroupChat.BackColor = Color.FromArgb(60, 100, 160);
+                btnGroupChat.Text = "📢 Group Chat";
+            }
 
-                    _selectedUserId = kvp.Key;
-                    _selectedUserName = kvp.Value;
-                    lblChatWith.Text = $"💬 Chat with {kvp.Value}";
+            _selectedUserId = userId;
+            _selectedUserName = displayName;
+            lblChatWith.Text = $"💬 Chat with {displayName}";
 
-                    // Clear unread
-                    _unreadCounts.Remove(kvp.Key);
-                    RefreshUserListBadges();
+            // Clear unread badge while preserving current selection
+            if (_unreadCounts.Remove(userId))
+            {
+                RefreshUserListBadges(preserveSelection: true);
+            }
 
-                    // Load chat history from server
-                    rtbChat.Clear();
-                    AppendSystem("Loading...");
-                    var histReq = new Packet(PacketType.ChatHistoryRequest, _currentUserId, _selectedUserId, null);
-                    _tcpService.SendPacket(histReq);
+            // Load chat history from server
+            rtbChat.Clear();
+            AppendSystem("Loading...");
+            var histReq = new Packet(PacketType.ChatHistoryRequest, _currentUserId, _selectedUserId, null);
+            _tcpService.SendPacket(histReq);
 
-                    // Initiate DH key exchange if not established yet
-                    if (!_chatService.HasSharedKey(_selectedUserId))
-                    {
-                        InitiateKeyExchange(_selectedUserId);
-                    }
-
-                    break;
-                }
-                idx++;
+            // Initiate DH key exchange if not established yet
+            if (!_chatService.HasSharedKey(_selectedUserId))
+            {
+                InitiateKeyExchange(_selectedUserId);
             }
         }
 
@@ -618,51 +609,56 @@ namespace ZTalk.Client.Forms
 
         private void btnEmoji_Click(object sender, EventArgs e)
         {
-            // Create popup menu for emoji
-            var menu = new ContextMenuStrip();
-            menu.BackColor = Color.FromArgb(45, 45, 50);
-            menu.ForeColor = Color.White;
-            menu.ShowImageMargin = false;
-
-            // Display emojis in FlowLayoutPanel
-            var flowPanel = new FlowLayoutPanel
+            if (_emojiMenu == null)
             {
-                AutoSize = true,
-                MaximumSize = new Size(240, 200),
-                BackColor = Color.FromArgb(45, 45, 50),
-                Padding = new Padding(5)
-            };
-
-            foreach (var emoji in CommonEmojis)
-            {
-                var btn = new Button
+                _emojiFont = new Font("Segoe UI Emoji", 14F);
+                _emojiMenu = new ContextMenuStrip
                 {
-                    Text = emoji,
-                    Font = new Font("Segoe UI Emoji", 14F),
-                    Size = new Size(36, 36),
-                    FlatStyle = FlatStyle.Flat,
-                    BackColor = Color.FromArgb(55, 55, 60),
+                    BackColor = Color.FromArgb(45, 45, 50),
                     ForeColor = Color.White,
-                    Margin = new Padding(2),
-                    Cursor = Cursors.Hand
+                    ShowImageMargin = false
                 };
-                btn.FlatAppearance.BorderSize = 0;
-                btn.Click += (s, args) =>
+
+                var flowPanel = new FlowLayoutPanel
                 {
-                    txtMessage.Text += ((Button)s).Text;
-                    txtMessage.SelectionStart = txtMessage.Text.Length;
-                    txtMessage.Focus();
-                    menu.Close();
+                    AutoSize = true,
+                    MaximumSize = new Size(240, 200),
+                    BackColor = Color.FromArgb(45, 45, 50),
+                    Padding = new Padding(5)
                 };
-                flowPanel.Controls.Add(btn);
+
+                foreach (var emoji in CommonEmojis)
+                {
+                    var btn = new Button
+                    {
+                        Text = emoji,
+                        Font = _emojiFont,
+                        Size = new Size(36, 36),
+                        FlatStyle = FlatStyle.Flat,
+                        BackColor = Color.FromArgb(55, 55, 60),
+                        ForeColor = Color.White,
+                        Margin = new Padding(2),
+                        Cursor = Cursors.Hand
+                    };
+                    btn.FlatAppearance.BorderSize = 0;
+                    btn.Click += (s, args) =>
+                    {
+                        txtMessage.Text += ((Button)s).Text;
+                        txtMessage.SelectionStart = txtMessage.Text.Length;
+                        txtMessage.Focus();
+                        _emojiMenu.Close();
+                    };
+                    flowPanel.Controls.Add(btn);
+                }
+
+                var host = new ToolStripControlHost(flowPanel)
+                {
+                    AutoSize = true
+                };
+                _emojiMenu.Items.Add(host);
             }
 
-            var host = new ToolStripControlHost(flowPanel)
-            {
-                AutoSize = true
-            };
-            menu.Items.Add(host);
-            menu.Show(btnEmoji, new Point(0, -210));
+            _emojiMenu.Show(btnEmoji, new Point(0, -210));
         }
 
         private void btnGroupChat_Click(object sender, EventArgs e)
@@ -671,7 +667,10 @@ namespace ZTalk.Client.Forms
 
             if (_isGroupChatMode)
             {
-                lstUsers.ClearSelected();
+                _suppressSelectionEvent = true;
+                try { lstUsers.ClearSelected(); }
+                finally { _suppressSelectionEvent = false; }
+
                 _selectedUserId = null;
                 _selectedUserName = null;
                 lblChatWith.Text = "📢 Group Chat (All online users)";
@@ -693,7 +692,7 @@ namespace ZTalk.Client.Forms
             }
         }
 
-        private void btnSendFile_Click(object sender, EventArgs e)
+        private async void btnSendFile_Click(object sender, EventArgs e)
         {
             if (string.IsNullOrEmpty(_selectedUserId))
             {
@@ -701,17 +700,33 @@ namespace ZTalk.Client.Forms
                 return;
             }
 
+            string targetUserId = _selectedUserId;
             using (var ofd = new OpenFileDialog())
             {
                 ofd.Title = "Select file to send";
                 ofd.Filter = "All Files|*.*|Images|*.jpg;*.png;*.gif;*.bmp";
                 if (ofd.ShowDialog() == DialogResult.OK)
                 {
-                    _fileTransferService.SendFile(_selectedUserId, ofd.FileName);
-                    string fileName = System.IO.Path.GetFileName(ofd.FileName);
+                    string selectedPath = ofd.FileName;
+                    string fileName = System.IO.Path.GetFileName(selectedPath);
                     AppendSystem($"📎 Sending file: {fileName}");
-                    _historyService.SaveMessage(_selectedUserId, _currentUserId, _currentDisplayName,
-                        $"[File] {fileName}", true);
+
+                    btnSendFile.Enabled = false;
+                    try
+                    {
+                        await Task.Run(() => _fileTransferService.SendFile(targetUserId, selectedPath));
+                        _historyService.SaveMessage(targetUserId, _currentUserId, _currentDisplayName,
+                            $"[File] {fileName}", true);
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendSystem($"❌ Failed to send file: {ex.Message}");
+                    }
+                    finally
+                    {
+                        if (!IsDisposed && !Disposing)
+                            btnSendFile.Enabled = true;
+                    }
                 }
             }
         }
@@ -739,23 +754,40 @@ namespace ZTalk.Client.Forms
             _tcpService.OnPacketReceived -= HandlePacket;
             _tcpService.OnDisconnected -= HandleDisconnected;
 
-            // End video call if active
+            _videoCallService.OnIncomingCall -= HandleIncomingCall;
+            _videoCallService.OnCallAccepted -= HandleCallAccepted;
+            _videoCallService.OnCallEnded -= HandleCallEnded;
+            _videoCallService.OnCallRejected -= HandleCallRejected;
+
+            // End video call and release media/UDP resources
             if (_videoCallService.IsInCall)
             {
                 _videoCallService.EndCall();
             }
             CloseVideoCallForm();
+            _videoCallService.Dispose();
 
             // Send disconnect packet
             var packet = new Packet(PacketType.Disconnect, _currentUserId, null, null);
             _tcpService.SendPacket(packet);
-            _tcpService.Disconnect();
+            _tcpService.Dispose();
 
-            // Dispose DH instances
+            // Dispose timers, emoji popup, and DH instances
+            _typingSendTimer?.Stop();
+            _typingSendTimer?.Dispose();
+            _typingDisplayTimer?.Stop();
+            _typingDisplayTimer?.Dispose();
+
+            _emojiMenu?.Dispose();
+            _emojiMenu = null;
+            _emojiFont?.Dispose();
+            _emojiFont = null;
+
             foreach (var dh in _dhInstances.Values)
             {
                 dh.Dispose();
             }
+            _dhInstances.Clear();
         }
 
         #endregion
@@ -797,13 +829,10 @@ namespace ZTalk.Client.Forms
 
             if (_isGroupChatMode)
             {
-                // Group chat: broadcast to all online users
-                var data = string.Format("{{\"Content\":\"{0}\"}}", EscapeJsonString(message));
-                foreach (var kvp in _onlineUsers)
-                {
-                    var packet = new Packet(PacketType.GroupMessage, _currentUserId, kvp.Key, data);
-                    _tcpService.SendPacket(packet);
-                }
+                // Send a single broadcast GroupMessage packet (server fans out once and stores once)
+                var dto = new MessageDTO { Content = message, IsEncrypted = false, SentAt = DateTime.Now };
+                var packet = new Packet(PacketType.GroupMessage, _currentUserId, null, PacketSerializer.ToJson(dto));
+                _tcpService.SendPacket(packet);
 
                 AppendChat(_currentDisplayName, message, Color.LimeGreen);
                 _historyService.SaveMessage("__group__", _currentUserId, _currentDisplayName, message, false);
@@ -824,7 +853,7 @@ namespace ZTalk.Client.Forms
         private void InitiateKeyExchange(string targetUserId)
         {
             var dh = new DiffieHellmanHelper();
-            _dhInstances[targetUserId] = dh;
+            SetDhInstance(targetUserId, dh);
 
             var publicKey = dh.GetPublicKey();
             var packet = new Packet(PacketType.KeyExchange, _currentUserId, targetUserId, publicKey);
@@ -833,44 +862,62 @@ namespace ZTalk.Client.Forms
             AppendSystem($"🔑 Performing key exchange with {GetUserName(targetUserId)}...");
         }
 
+        private void TrimChatIfNeeded()
+        {
+            if (rtbChat.TextLength > MaxChatChars)
+            {
+                rtbChat.Select(0, rtbChat.TextLength / 2);
+                rtbChat.SelectedText = string.Empty;
+            }
+        }
+
         private void AppendChat(string sender, string message, Color color)
         {
-            var timestamp = DateTime.Now.ToString("HH:mm");
+            MarshalToUi(() =>
+            {
+                TrimChatIfNeeded();
+                var timestamp = DateTime.Now.ToString("HH:mm");
 
-            rtbChat.SelectionStart = rtbChat.TextLength;
-            rtbChat.SelectionLength = 0;
+                rtbChat.SelectionStart = rtbChat.TextLength;
+                rtbChat.SelectionLength = 0;
 
-            // Timestamp
-            rtbChat.SelectionColor = Color.Gray;
-            rtbChat.AppendText($"[{timestamp}] ");
+                // Timestamp
+                rtbChat.SelectionColor = Color.Gray;
+                rtbChat.AppendText($"[{timestamp}] ");
 
-            // Sender name
-            rtbChat.SelectionColor = color;
-            rtbChat.AppendText($"{sender}: ");
+                // Sender name
+                rtbChat.SelectionColor = color;
+                rtbChat.AppendText($"{sender}: ");
 
-            // Message
-            rtbChat.SelectionColor = Color.White;
-            rtbChat.AppendText($"{message}\n");
+                // Message
+                rtbChat.SelectionColor = Color.White;
+                rtbChat.AppendText($"{message}\n");
 
-            rtbChat.ScrollToCaret();
+                rtbChat.ScrollToCaret();
+            });
         }
 
         private void AppendSystem(string message)
         {
-            rtbChat.SelectionStart = rtbChat.TextLength;
-            rtbChat.SelectionLength = 0;
-            rtbChat.SelectionColor = Color.FromArgb(255, 200, 100);
-            rtbChat.AppendText($"  {message}\n");
-            rtbChat.ScrollToCaret();
+            MarshalToUi(() =>
+            {
+                TrimChatIfNeeded();
+                rtbChat.SelectionStart = rtbChat.TextLength;
+                rtbChat.SelectionLength = 0;
+                rtbChat.SelectionColor = Color.FromArgb(255, 200, 100);
+                rtbChat.AppendText($"  {message}\n");
+                rtbChat.ScrollToCaret();
+            });
         }
 
         private string GetUserName(string userId)
         {
+            if (string.IsNullOrEmpty(userId)) return "Unknown";
             string name;
             return _onlineUsers.TryGetValue(userId, out name) ? name : userId;
         }
 
-        private string FormatFileSize(long bytes)
+        private static string FormatFileSize(long bytes)
         {
             if (bytes < 1024) return $"{bytes} B";
             if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
@@ -878,60 +925,43 @@ namespace ZTalk.Client.Forms
             return $"{bytes / (1024.0 * 1024 * 1024):F1} GB";
         }
 
-        private string GetJsonField(string json, string field)
-        {
-            if (string.IsNullOrEmpty(json)) return null;
-
-            var search = "\"" + field + "\":";
-            int idx = json.IndexOf(search, StringComparison.Ordinal);
-            if (idx < 0) return null;
-
-            idx += search.Length;
-            while (idx < json.Length && json[idx] == ' ') idx++;
-
-            if (idx >= json.Length) return null;
-
-            if (json[idx] == '"')
-            {
-                idx++;
-                var sb = new StringBuilder();
-                bool escaped = false;
-                while (idx < json.Length)
-                {
-                    char c = json[idx];
-                    if (escaped) { sb.Append(c); escaped = false; }
-                    else if (c == '\\') { escaped = true; }
-                    else if (c == '"') { break; }
-                    else { sb.Append(c); }
-                    idx++;
-                }
-                return sb.ToString();
-            }
-            else
-            {
-                var sb = new StringBuilder();
-                while (idx < json.Length && json[idx] != ',' && json[idx] != '}')
-                {
-                    sb.Append(json[idx]);
-                    idx++;
-                }
-                return sb.ToString().Trim();
-            }
-        }
-
         #endregion
 
         #region Badge & Sound
 
-        private void RefreshUserListBadges()
+        private void RefreshUserListBadges(bool preserveSelection = false)
         {
-            lstUsers.Items.Clear();
-            foreach (var kvp in _onlineUsers)
+            _suppressSelectionEvent = true;
+            lstUsers.BeginUpdate();
+            try
             {
-                int unread;
-                _unreadCounts.TryGetValue(kvp.Key, out unread);
-                string badge = unread > 0 ? $" ({unread})" : "";
-                lstUsers.Items.Add($"🟢 {kvp.Value}{badge}");
+                lstUsers.Items.Clear();
+                int selectedIdx = -1;
+
+                for (int i = 0; i < _onlineUserOrder.Count; i++)
+                {
+                    string uid = _onlineUserOrder[i];
+                    string name = _onlineUsers[uid];
+                    int unread;
+                    _unreadCounts.TryGetValue(uid, out unread);
+                    string badge = unread > 0 ? $" ({unread})" : "";
+                    lstUsers.Items.Add($"🟢 {name}{badge}");
+
+                    if (preserveSelection && uid == _selectedUserId)
+                    {
+                        selectedIdx = i;
+                    }
+                }
+
+                if (selectedIdx >= 0)
+                {
+                    lstUsers.SelectedIndex = selectedIdx;
+                }
+            }
+            finally
+            {
+                lstUsers.EndUpdate();
+                _suppressSelectionEvent = false;
             }
         }
 
@@ -942,12 +972,6 @@ namespace ZTalk.Client.Forms
                 SystemSounds.Asterisk.Play();
             }
             catch { }
-        }
-
-        private string EscapeJsonString(string s)
-        {
-            if (s == null) return "";
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "");
         }
 
         #endregion

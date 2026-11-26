@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using ZTalk.Server.Models;
@@ -9,13 +8,13 @@ using ZTalk.Server.Models;
 namespace ZTalk.Server.Data
 {
     /// <summary>
-    /// Lưu trữ user accounts trên server.
-    /// Dùng file JSON đơn giản (có thể nâng cấp lên SQLite sau).
+    /// Lưu trữ user accounts trên server với O(1) dictionary index và atomic persistence.
     /// </summary>
     public class UserStore
     {
         private readonly string _filePath;
         private List<UserAccount> _users;
+        private Dictionary<string, UserAccount> _usersByUsername;
         private readonly object _lock = new object();
 
         public UserStore(string filePath = null)
@@ -25,15 +24,22 @@ namespace ZTalk.Server.Data
         }
 
         /// <summary>
-        /// Xác thực user bằng username và password hash
+        /// Xác thực user bằng username và password hash (O(1) lookup + constant-time compare)
         /// </summary>
         public UserAccount Authenticate(string username, string passwordHash)
         {
+            if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(passwordHash))
+                return null;
+
             lock (_lock)
             {
-                return _users.FirstOrDefault(u =>
-                    u.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
-                    u.PasswordHash == passwordHash);
+                UserAccount user;
+                if (_usersByUsername.TryGetValue(username, out user) &&
+                    FixedTimeEquals(user.PasswordHash, passwordHash))
+                {
+                    return user;
+                }
+                return null;
             }
         }
 
@@ -42,10 +48,13 @@ namespace ZTalk.Server.Data
         /// </summary>
         public bool Register(string username, string passwordHash, string displayName)
         {
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrEmpty(passwordHash))
+                return false;
+
             lock (_lock)
             {
-                // Kiểm tra trùng username
-                if (_users.Any(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase)))
+                // O(1) duplicate username check
+                if (_usersByUsername.ContainsKey(username))
                     return false;
 
                 var user = new UserAccount
@@ -58,20 +67,23 @@ namespace ZTalk.Server.Data
                 };
 
                 _users.Add(user);
+                _usersByUsername[username] = user;
                 SaveUsers();
                 return true;
             }
         }
 
         /// <summary>
-        /// Lấy user theo username
+        /// Lấy user theo username (O(1))
         /// </summary>
         public UserAccount GetByUsername(string username)
         {
+            if (string.IsNullOrEmpty(username)) return null;
+
             lock (_lock)
             {
-                return _users.FirstOrDefault(u =>
-                    u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+                UserAccount user;
+                return _usersByUsername.TryGetValue(username, out user) ? user : null;
             }
         }
 
@@ -87,56 +99,97 @@ namespace ZTalk.Server.Data
             }
         }
 
+        private static bool FixedTimeEquals(string a, string b)
+        {
+            if (a == null || b == null || a.Length != b.Length)
+                return false;
+
+            int diff = 0;
+            for (int i = 0; i < a.Length; i++)
+            {
+                diff |= a[i] ^ b[i];
+            }
+            return diff == 0;
+        }
+
         private void LoadUsers()
         {
             _users = new List<UserAccount>();
+            _usersByUsername = new Dictionary<string, UserAccount>(StringComparer.OrdinalIgnoreCase);
 
-            if (File.Exists(_filePath))
+            bool fileExisted = File.Exists(_filePath);
+            if (fileExisted)
             {
                 try
                 {
                     var json = File.ReadAllText(_filePath, Encoding.UTF8);
                     _users = ZTalk.Shared.Protocol.PacketSerializer.FromJson<List<UserAccount>>(json) ?? new List<UserAccount>();
+                    foreach (var u in _users)
+                    {
+                        if (!string.IsNullOrEmpty(u?.Username))
+                            _usersByUsername[u.Username] = u;
+                    }
                 }
                 catch
                 {
+                    try
+                    {
+                        File.Copy(_filePath, _filePath + ".corrupt." + DateTime.UtcNow.Ticks, true);
+                    }
+                    catch { }
                     _users = new List<UserAccount>();
+                    _usersByUsername.Clear();
                 }
             }
 
-            // Ensure default demo accounts (alice, bob, charlie) always exist with password "123"
-            EnsureDemoUsers();
-            SaveUsers();
-        }
-
-        private void EnsureDemoUsers()
-        {
-            EnsureUser("user_alice", "alice", "123", "Alice Johnson");
-            EnsureUser("user_bob", "bob", "123", "Bob Williams");
-            EnsureUser("user_charlie", "charlie", "123", "Charlie Davis");
-        }
-
-        private void EnsureUser(string id, string username, string password, string displayName)
-        {
-            var user = _users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
-            if (user == null)
+            // Ensure default demo accounts (alice, bob, charlie) exist with password "123"
+            bool modified = EnsureDemoUsers();
+            if (modified || !fileExisted)
             {
-                _users.Add(new UserAccount
+                SaveUsers();
+            }
+        }
+
+        private bool EnsureDemoUsers()
+        {
+            bool changed = false;
+            changed |= EnsureUser("user_alice", "alice", "123", "Alice Johnson");
+            changed |= EnsureUser("user_bob", "bob", "123", "Bob Williams");
+            changed |= EnsureUser("user_charlie", "charlie", "123", "Charlie Davis");
+            return changed;
+        }
+
+        private bool EnsureUser(string id, string username, string password, string displayName)
+        {
+            string expectedHash = HashPassword(password);
+            UserAccount user;
+            if (!_usersByUsername.TryGetValue(username, out user))
+            {
+                user = new UserAccount
                 {
                     UserId = id,
                     Username = username,
-                    PasswordHash = HashPassword(password),
+                    PasswordHash = expectedHash,
                     DisplayName = displayName,
                     CreatedAt = DateTime.Now
-                });
+                };
+                _users.Add(user);
+                _usersByUsername[username] = user;
+                return true;
             }
-            else
+
+            bool changed = false;
+            if (user.PasswordHash != expectedHash)
             {
-                // Guarantee demo password is always valid
-                user.PasswordHash = HashPassword(password);
-                if (string.IsNullOrEmpty(user.DisplayName))
-                    user.DisplayName = displayName;
+                user.PasswordHash = expectedHash;
+                changed = true;
             }
+            if (string.IsNullOrEmpty(user.DisplayName))
+            {
+                user.DisplayName = displayName;
+                changed = true;
+            }
+            return changed;
         }
 
         private void SaveUsers()
@@ -144,7 +197,13 @@ namespace ZTalk.Server.Data
             try
             {
                 var json = ZTalk.Shared.Protocol.PacketSerializer.ToJson(_users);
-                File.WriteAllText(_filePath, json, Encoding.UTF8);
+                string tempPath = _filePath + ".tmp";
+                File.WriteAllText(tempPath, json, Encoding.UTF8);
+
+                if (File.Exists(_filePath))
+                    File.Replace(tempPath, _filePath, null);
+                else
+                    File.Move(tempPath, _filePath);
             }
             catch (Exception ex)
             {

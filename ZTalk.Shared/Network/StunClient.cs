@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 
 namespace ZTalk.Shared.Network
 {
@@ -27,6 +28,9 @@ namespace ZTalk.Shared.Network
         private const ushort MappedAddressAttr = 0x0001;
         private const ushort XorMappedAddressAttr = 0x0020;
         private const uint MagicCookie = 0x2112A442;
+
+        // Cryptographic RNG for RFC 5389 96-bit transaction IDs
+        private static readonly RandomNumberGenerator _rng = RandomNumberGenerator.Create();
 
         /// <summary>
         /// Discover public endpoint (IP:Port) qua STUN server.
@@ -55,6 +59,8 @@ namespace ZTalk.Shared.Network
         /// </summary>
         public static IPEndPoint GetPublicEndPoint(UdpClient udpClient)
         {
+            if (udpClient == null) return null;
+
             foreach (var server in StunServers)
             {
                 for (int retry = 0; retry < MaxRetries; retry++)
@@ -75,54 +81,64 @@ namespace ZTalk.Shared.Network
         {
             using (var client = new UdpClient(localPort))
             {
-                client.Client.ReceiveTimeout = TimeoutMs;
                 return SendBindingRequest(client, server, port);
             }
         }
 
         private static IPEndPoint SendBindingRequest(UdpClient client, string server, int port)
         {
+            int previousTimeout = client.Client.ReceiveTimeout;
             client.Client.ReceiveTimeout = TimeoutMs;
 
-            // Build STUN Binding Request
-            //  0                   1                   2                   3
-            //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            // |0 0|     STUN Message Type     |         Message Length        |
-            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            // |                         Magic Cookie                          |
-            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            // |                     Transaction ID (96 bits)                   |
-            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            try
+            {
+                // Build STUN Binding Request (20-byte header)
+                var transactionId = new byte[12];
+                _rng.GetBytes(transactionId);
 
-            var transactionId = new byte[12];
-            new Random().NextBytes(transactionId);
+                var request = new byte[20];
+                // Message Type: Binding Request (0x0001)
+                request[0] = 0x00; request[1] = 0x01;
+                // Message Length: 0 (no attributes)
+                request[2] = 0x00; request[3] = 0x00;
+                // Magic Cookie
+                request[4] = 0x21; request[5] = 0x12;
+                request[6] = 0xA4; request[7] = 0x42;
+                // Transaction ID
+                Buffer.BlockCopy(transactionId, 0, request, 8, 12);
 
-            var request = new byte[20];
-            // Message Type: Binding Request (0x0001)
-            request[0] = 0x00; request[1] = 0x01;
-            // Message Length: 0 (no attributes)
-            request[2] = 0x00; request[3] = 0x00;
-            // Magic Cookie
-            request[4] = 0x21; request[5] = 0x12;
-            request[6] = 0xA4; request[7] = 0x42;
-            // Transaction ID
-            Array.Copy(transactionId, 0, request, 8, 12);
+                // Resolve IPv4 address for IPv4 UdpClient
+                var addresses = Dns.GetHostAddresses(server);
+                IPAddress ipv4 = null;
+                for (int i = 0; i < addresses.Length; i++)
+                {
+                    if (addresses[i].AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        ipv4 = addresses[i];
+                        break;
+                    }
+                }
+                if (ipv4 == null)
+                    return null;
 
-            // Resolve server
-            var serverEp = new IPEndPoint(Dns.GetHostAddresses(server)[0], port);
-            client.Send(request, request.Length, serverEp);
+                var serverEp = new IPEndPoint(ipv4, port);
+                client.Send(request, request.Length, serverEp);
 
-            // Receive response
-            var remoteEp = new IPEndPoint(IPAddress.Any, 0);
-            var response = client.Receive(ref remoteEp);
+                // Receive response
+                var remoteEp = new IPEndPoint(IPAddress.Any, 0);
+                var response = client.Receive(ref remoteEp);
 
-            return ParseBindingResponse(response, transactionId);
+                return ParseBindingResponse(response, transactionId);
+            }
+            finally
+            {
+                try { client.Client.ReceiveTimeout = previousTimeout; } catch { }
+            }
         }
 
         internal static IPEndPoint ParseBindingResponse(byte[] data, byte[] transactionId)
         {
-            if (data == null || data.Length < 20)
+            if (data == null || data.Length < 20 || transactionId == null || transactionId.Length < 12)
                 return null;
 
             // Verify Binding Response
@@ -143,14 +159,18 @@ namespace ZTalk.Shared.Network
             }
 
             ushort msgLength = (ushort)((data[2] << 8) | data[3]);
+            int messageEnd = Math.Min(data.Length, 20 + msgLength);
             int offset = 20;
 
-            // Parse attributes
-            while (offset + 4 <= 20 + msgLength)
+            // Parse attributes with strict bounds checks against data.Length
+            while (offset + 4 <= messageEnd)
             {
                 ushort attrType = (ushort)((data[offset] << 8) | data[offset + 1]);
                 ushort attrLength = (ushort)((data[offset + 2] << 8) | data[offset + 3]);
                 offset += 4;
+
+                if (offset + attrLength > messageEnd)
+                    return null; // Truncated or malformed attribute length
 
                 if (attrType == XorMappedAddressAttr && attrLength >= 8)
                 {
@@ -163,8 +183,9 @@ namespace ZTalk.Shared.Network
 
                 // Align to 4 bytes
                 offset += attrLength;
-                if (offset % 4 != 0)
-                    offset += 4 - (offset % 4);
+                int remainder = offset & 3;
+                if (remainder != 0)
+                    offset += 4 - remainder;
             }
 
             return null;

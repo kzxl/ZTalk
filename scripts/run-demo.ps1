@@ -1,4 +1,4 @@
-# SimpleChatBox Automated Demo Launcher
+# ZTalk Automated Demo Launcher
 # Builds the solution, runs automated tests, and launches Server + 2 Pre-configured Demo Clients (Alice & Bob)
 
 $ErrorActionPreference = "Stop"
@@ -6,12 +6,12 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Split-Path -Parent $ScriptDir
 
 Write-Host "==================================================" -ForegroundColor Cyan
-Write-Host "   SimpleChatBox Demo Launch Orchestrator          " -ForegroundColor Cyan
+Write-Host "   ZTalk Demo Launch Orchestrator                 " -ForegroundColor Cyan
 Write-Host "==================================================" -ForegroundColor Cyan
 
 # 1. Build Solution
 Write-Host "[1/4] Building solution..." -ForegroundColor Yellow
-& dotnet build "$RootDir\ChatBoxSimple.sln" -c Debug
+& dotnet build "$RootDir\ZTalk.sln" -c Debug
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Build failed! Please check compilation errors."
     exit 1
@@ -19,7 +19,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # 2. Run Automated Tests
 Write-Host "[2/4] Running automated test suite..." -ForegroundColor Yellow
-& "$RootDir\ChatBox.Tests\bin\Debug\ChatBox.Tests.exe"
+& "$RootDir\ZTalk.Tests\bin\Debug\ZTalk.Tests.exe"
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Automated tests failed!"
     exit 1
@@ -27,14 +27,14 @@ if ($LASTEXITCODE -ne 0) {
 
 # 3. Launch Server
 Write-Host "[3/4] Starting Server Dashboard..." -ForegroundColor Yellow
-$serverExe = "$RootDir\ChatBox.Server\bin\Debug\ChatBox.Server.exe"
+$serverExe = "$RootDir\ZTalk.Server\bin\Debug\ZTalk.Server.exe"
 Start-Process -FilePath $serverExe -ArgumentList "autostart" -WorkingDirectory (Split-Path -Parent $serverExe)
 
 Start-Sleep -Milliseconds 1500
 
 # 4. Launch 2 Clients with 1-Click Auto-Login
 Write-Host "[4/4] Launching Demo Clients (Alice & Bob)..." -ForegroundColor Yellow
-$clientExe = "$RootDir\ChatBox.Client\bin\Debug\ChatBox.Client.exe"
+$clientExe = "$RootDir\ZTalk.Client\bin\Debug\ZTalk.Client.exe"
 Start-Process -FilePath $clientExe -ArgumentList "demo_alice" -WorkingDirectory (Split-Path -Parent $clientExe)
 Start-Sleep -Milliseconds 500
 Start-Process -FilePath $clientExe -ArgumentList "demo_bob" -WorkingDirectory (Split-Path -Parent $clientExe)

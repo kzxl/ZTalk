@@ -9,6 +9,7 @@ namespace ZTalk.Tests
         {
             TestAesEncryptionDecryption();
             TestDiffieHellmanKeyExchange();
+            TestAesRejectsShortCiphertext();
         }
 
         private static void TestAesEncryptionDecryption()
@@ -49,6 +50,23 @@ namespace ZTalk.Tests
 
                 Assert.Equal(aliceSharedB64, bobSharedB64, "Both peers must compute the exact same ECDH shared key!");
             }
+        }
+
+        private static void TestAesRejectsShortCiphertext()
+        {
+            var aes = new AesHelper();
+            byte[] key = AesHelper.GenerateRandomKey();
+
+            bool threw = false;
+            try
+            {
+                aes.DecryptBytes(new byte[8], key);
+            }
+            catch (ArgumentException)
+            {
+                threw = true;
+            }
+            Assert.True(threw, "AesHelper.DecryptBytes must reject ciphertext shorter than 16-byte IV");
         }
     }
 }

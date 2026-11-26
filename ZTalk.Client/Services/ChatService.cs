@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using ZTalk.Shared.Crypto;
+using ZTalk.Shared.DTOs;
 using ZTalk.Shared.Protocol;
 
 namespace ZTalk.Client.Services
@@ -34,18 +35,20 @@ namespace ZTalk.Client.Services
             bool isEncrypted = false;
 
             byte[] key;
-            if (_sharedKeys.TryGetValue(receiverId, out key))
+            if (!string.IsNullOrEmpty(receiverId) && _sharedKeys.TryGetValue(receiverId, out key))
             {
                 content = _aesHelper.Encrypt(message, key);
                 isEncrypted = true;
             }
 
-            var data = string.Format(
-                "{{\"Content\":\"{0}\",\"IsEncrypted\":{1},\"SentAt\":\"{2:O}\"}}",
-                EscapeJson(content),
-                isEncrypted.ToString().ToLower(),
-                DateTime.Now);
+            var dto = new MessageDTO
+            {
+                Content = content,
+                IsEncrypted = isEncrypted,
+                SentAt = DateTime.Now
+            };
 
+            var data = PacketSerializer.ToJson(dto);
             var packet = new Packet(PacketType.Message, CurrentUserId, receiverId, data);
             _tcpService.SendPacket(packet);
         }
@@ -58,7 +61,7 @@ namespace ZTalk.Client.Services
             if (!isEncrypted) return content;
 
             byte[] key;
-            if (_sharedKeys.TryGetValue(senderId, out key))
+            if (!string.IsNullOrEmpty(senderId) && _sharedKeys.TryGetValue(senderId, out key))
             {
                 try
                 {
@@ -74,6 +77,52 @@ namespace ZTalk.Client.Services
         }
 
         /// <summary>
+        /// Mã hoá dữ liệu nhị phân (file chunk) bằng shared key của receiver nếu đã trao đổi khoá
+        /// </summary>
+        public bool TryEncryptBytes(string receiverId, byte[] buffer, int offset, int count, out byte[] encrypted)
+        {
+            encrypted = null;
+            byte[] key;
+            if (string.IsNullOrEmpty(receiverId) || !_sharedKeys.TryGetValue(receiverId, out key))
+                return false;
+
+            byte[] slice;
+            if (offset == 0 && count == buffer.Length)
+            {
+                slice = buffer;
+            }
+            else
+            {
+                slice = new byte[count];
+                Buffer.BlockCopy(buffer, offset, slice, 0, count);
+            }
+
+            encrypted = _aesHelper.EncryptBytes(slice, key);
+            return true;
+        }
+
+        /// <summary>
+        /// Giải mã dữ liệu nhị phân (file chunk) bằng shared key của sender
+        /// </summary>
+        public bool TryDecryptBytes(string senderId, byte[] encryptedData, out byte[] decrypted)
+        {
+            decrypted = null;
+            byte[] key;
+            if (string.IsNullOrEmpty(senderId) || encryptedData == null || !_sharedKeys.TryGetValue(senderId, out key))
+                return false;
+
+            try
+            {
+                decrypted = _aesHelper.DecryptBytes(encryptedData, key);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Lưu shared key cho 1 user (sau khi DH key exchange hoàn tất)
         /// </summary>
         public void SetSharedKey(string userId, byte[] key)
@@ -86,13 +135,7 @@ namespace ZTalk.Client.Services
         /// </summary>
         public bool HasSharedKey(string userId)
         {
-            return _sharedKeys.ContainsKey(userId);
-        }
-
-        private string EscapeJson(string s)
-        {
-            if (s == null) return "";
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
+            return !string.IsNullOrEmpty(userId) && _sharedKeys.ContainsKey(userId);
         }
     }
 }

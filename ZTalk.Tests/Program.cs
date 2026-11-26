@@ -16,7 +16,7 @@ namespace ZTalk.Tests
             }
 
             Console.WriteLine("==================================================");
-            Console.WriteLine("   ChatBoxSimple Automated Test Suite (.NET 4.8)  ");
+            Console.WriteLine("   ZTalk Automated Test Suite (.NET 4.8)          ");
             Console.WriteLine("==================================================");
 
             int passed = 0;

@@ -1,10 +1,10 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ZTalk.Client.Services;
+using ZTalk.Shared.DTOs;
 using ZTalk.Shared.Protocol;
 
 namespace ZTalk.Client.Forms
@@ -14,8 +14,9 @@ namespace ZTalk.Client.Forms
     /// </summary>
     public partial class frmLogin : Form
     {
-        private TcpClientService _tcpService;
+        private readonly TcpClientService _tcpService;
         private readonly string _autoLoginUser;
+        private bool _autoLoginTriggered;
 
         public string LoggedInUserId { get; private set; }
         public string LoggedInDisplayName { get; private set; }
@@ -26,14 +27,6 @@ namespace ZTalk.Client.Forms
             InitializeComponent();
             _autoLoginUser = autoLoginUser;
             _tcpService = new TcpClientService();
-        }
-
-        private bool _autoLoginTriggered;
-
-        protected override void OnLoad(EventArgs e)
-        {
-            base.OnLoad(e);
-            TryAutoLogin();
         }
 
         protected override void OnShown(EventArgs e)
@@ -51,7 +44,10 @@ namespace ZTalk.Client.Forms
             txtUsername.Text = username;
             txtPassword.Text = "123";
             await Task.Delay(200);
-            await DoAuth(PacketType.Login);
+            if (!IsDisposed && !Disposing)
+            {
+                await DoAuth(PacketType.Login);
+            }
         }
 
         private async void btnLogin_Click(object sender, EventArgs e)
@@ -100,12 +96,15 @@ namespace ZTalk.Client.Forms
             lblStatus.Text = "Connecting to server...";
             lblStatus.ForeColor = System.Drawing.Color.Gray;
 
+            Action<Packet> handler = null;
             try
             {
                 // 1. Establish TCP connection
                 if (!_tcpService.IsConnected)
                 {
                     var connected = await _tcpService.ConnectAsync(txtServer.Text, (int)nudPort.Value);
+                    if (IsDisposed || Disposing) return;
+
                     if (!connected)
                     {
                         lblStatus.Text = "Cannot connect to server";
@@ -122,18 +121,16 @@ namespace ZTalk.Client.Forms
                     passwordHash = Convert.ToBase64String(bytes);
                 }
 
-                // 3. Send Login/Register packet
-                var authPayload = new Dictionary<string, object>
+                // 3. Send Login/Register packet using typed DTO
+                var authPayload = new LoginRequestDTO
                 {
-                    { "Username", txtUsername.Text.Trim() },
-                    { "PasswordHash", passwordHash }
+                    Username = txtUsername.Text.Trim(),
+                    PasswordHash = passwordHash
                 };
 
                 var data = PacketSerializer.ToJson(authPayload);
                 var packet = new Packet(authType, null, null, data);
 
-                // Single-response subscriber
-                Action<Packet> handler = null;
                 var tcs = new TaskCompletionSource<Packet>();
                 handler = p =>
                 {
@@ -151,6 +148,7 @@ namespace ZTalk.Client.Forms
                 // 4. Wait for response (10s timeout)
                 var timeoutTask = Task.Delay(10000);
                 var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
+                if (IsDisposed || Disposing) return;
 
                 if (completedTask == timeoutTask)
                 {
@@ -160,50 +158,44 @@ namespace ZTalk.Client.Forms
                     return;
                 }
 
-                var response = tcs.Task.Result;
+                var response = await tcs.Task;
 
-                // 5. Parse response
-                var respData = PacketSerializer.FromJson<Dictionary<string, object>>(response.Data);
-                bool success = false;
-                string message = null;
-                string userId = null;
-                string displayName = null;
-
-                if (respData != null)
+                // 5. Parse response via typed DTO
+                var respDto = PacketSerializer.FromJson<LoginResponseDTO>(response.Data);
+                if (respDto != null && respDto.Success)
                 {
-                    if (respData.ContainsKey("Success") && respData["Success"] != null)
-                        bool.TryParse(respData["Success"].ToString(), out success);
-                    if (respData.ContainsKey("Message") && respData["Message"] != null)
-                        message = respData["Message"].ToString();
-                    if (respData.ContainsKey("UserId") && respData["UserId"] != null)
-                        userId = respData["UserId"].ToString();
-                    if (respData.ContainsKey("DisplayName") && respData["DisplayName"] != null)
-                        displayName = respData["DisplayName"].ToString();
-                }
-
-                if (success)
-                {
-                    LoggedInUserId = userId;
-                    LoggedInDisplayName = displayName;
+                    LoggedInUserId = respDto.UserId;
+                    LoggedInDisplayName = respDto.DisplayName;
                     this.DialogResult = DialogResult.OK;
                     this.Close();
                 }
                 else
                 {
-                    lblStatus.Text = message ?? "Authentication failed";
+                    lblStatus.Text = respDto?.Message ?? "Authentication failed";
                     lblStatus.ForeColor = System.Drawing.Color.Red;
                 }
             }
             catch (Exception ex)
             {
-                lblStatus.Text = $"Error: {ex.Message}";
-                lblStatus.ForeColor = System.Drawing.Color.Red;
+                if (!IsDisposed && !Disposing)
+                {
+                    lblStatus.Text = $"Error: {ex.Message}";
+                    lblStatus.ForeColor = System.Drawing.Color.Red;
+                }
             }
             finally
             {
-                btnLogin.Enabled = true;
-                btnRegister.Enabled = true;
-                pnlDemo.Enabled = true;
+                if (handler != null)
+                {
+                    _tcpService.OnPacketReceived -= handler;
+                }
+
+                if (!IsDisposed && !Disposing)
+                {
+                    btnLogin.Enabled = true;
+                    btnRegister.Enabled = true;
+                    pnlDemo.Enabled = true;
+                }
             }
         }
     }

@@ -11,6 +11,7 @@ namespace ZTalk.Tests
             TestUserStoreAuthentication();
             TestUserStoreDuplicateRegistration();
             TestMessageStoreSaveAndRetrieve();
+            TestMessageStorePathTraversalAndPersistenceCache();
         }
 
         private static void TestUserStoreAuthentication()
@@ -74,6 +75,31 @@ namespace ZTalk.Tests
                 Assert.Equal(2, history.Count);
                 Assert.Equal("Hello u2!", history[0].Content);
                 Assert.Equal("Hey u1, received loud and clear.", history[1].Content);
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+            }
+        }
+
+        private static void TestMessageStorePathTraversalAndPersistenceCache()
+        {
+            string tempDir = Path.Combine(Path.GetTempPath(), $"chat_sec_{Guid.NewGuid():N}");
+            try
+            {
+                var msgStore = new MessageStore(tempDir);
+                msgStore.SaveMessage("u1", "../../escape_attempt", "user1", "Safe content", false);
+
+                // Ensure no file escaped tempDir
+                string parentDir = Directory.GetParent(tempDir).FullName;
+                Assert.False(File.Exists(Path.Combine(parentDir, "escape_attempt.json")),
+                    "MessageStore must block path traversal outside dataDir");
+
+                // Verify persistence across cold reload (new MessageStore instance)
+                var reloadedStore = new MessageStore(tempDir);
+                var history = reloadedStore.GetHistory("u1", "../../escape_attempt");
+                Assert.Equal(1, history.Count);
+                Assert.Equal("Safe content", history[0].Content);
             }
             finally
             {

@@ -10,7 +10,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Split-Path -Parent $ScriptDir
 
 Write-Host "==================================================" -ForegroundColor Cyan
-Write-Host "   SimpleChatBox Build & Publish Script           " -ForegroundColor Cyan
+Write-Host "   ZTalk Build & Publish Script                   " -ForegroundColor Cyan
 Write-Host "   Target Mode: $Mode                             " -ForegroundColor Cyan
 Write-Host "==================================================" -ForegroundColor Cyan
 
@@ -31,7 +31,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "[2/3] Running tests..." -ForegroundColor Yellow
-& "$RootDir\ChatBox.Tests\bin\$config\ChatBox.Tests.exe"
+& "$RootDir\ZTalk.Tests\bin\$config\ZTalk.Tests.exe"
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Test suite failed!"
     exit 1
@@ -39,25 +39,25 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "[3/3] Packaging distribution..." -ForegroundColor Yellow
 
-$serverOut = Join-Path $targetDir "ChatBox.Server"
-$clientOut = Join-Path $targetDir "ChatBox.Client"
+$serverOut = Join-Path $targetDir "ZTalk.Server"
+$clientOut = Join-Path $targetDir "ZTalk.Client"
 
 New-Item -ItemType Directory -Path $serverOut | Out-Null
 New-Item -ItemType Directory -Path $clientOut | Out-Null
 
 # Copy Server binaries
-Get-ChildItem "$RootDir\ChatBox.Server\bin\$config" -File | ForEach-Object {
+Get-ChildItem "$RootDir\ZTalk.Server\bin\$config" -File | ForEach-Object {
     if ($Mode -eq "Lite" -and ($_.Extension -eq ".pdb" -or $_.Extension -eq ".xml")) { return }
     Copy-Item $_.FullName -Destination $serverOut
 }
 
 # Copy Client binaries
-Get-ChildItem "$RootDir\ChatBox.Client\bin\$config" -File | ForEach-Object {
+Get-ChildItem "$RootDir\ZTalk.Client\bin\$config" -File | ForEach-Object {
     if ($Mode -eq "Lite" -and ($_.Extension -eq ".pdb" -or $_.Extension -eq ".xml")) { return }
     Copy-Item $_.FullName -Destination $clientOut
 }
 
-$zipFile = Join-Path $OutputDir "SimpleChatBox-v$Version-$Mode.zip"
+$zipFile = Join-Path $OutputDir "ZTalk-v$Version-$Mode.zip"
 if (Test-Path $zipFile) {
     Remove-Item $zipFile -Force
 }

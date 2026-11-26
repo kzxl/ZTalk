@@ -38,9 +38,11 @@ namespace ZTalk.Shared.Crypto
         /// </summary>
         public byte[] DeriveSharedSecret(string otherPublicKeyBase64)
         {
+            if (string.IsNullOrEmpty(otherPublicKeyBase64))
+                throw new ArgumentException("Public key cannot be null or empty.", nameof(otherPublicKeyBase64));
+
             var otherKeyBytes = Convert.FromBase64String(otherPublicKeyBase64);
-            var otherKey = CngKey.Import(otherKeyBytes, CngKeyBlobFormat.EccPublicBlob);
-            return _ecdh.DeriveKeyMaterial(otherKey);
+            return DeriveSharedSecret(otherKeyBytes);
         }
 
         /// <summary>
@@ -48,13 +50,22 @@ namespace ZTalk.Shared.Crypto
         /// </summary>
         public byte[] DeriveSharedSecret(byte[] otherPublicKeyBytes)
         {
-            var otherKey = CngKey.Import(otherPublicKeyBytes, CngKeyBlobFormat.EccPublicBlob);
-            return _ecdh.DeriveKeyMaterial(otherKey);
+            if (otherPublicKeyBytes == null || otherPublicKeyBytes.Length == 0)
+                throw new ArgumentException("Public key bytes cannot be null or empty.", nameof(otherPublicKeyBytes));
+
+            using (var otherKey = CngKey.Import(otherPublicKeyBytes, CngKeyBlobFormat.EccPublicBlob))
+            {
+                return _ecdh.DeriveKeyMaterial(otherKey);
+            }
         }
 
         public void Dispose()
         {
-            _ecdh?.Dispose();
+            if (_ecdh != null)
+            {
+                _ecdh.Dispose();
+                _ecdh = null;
+            }
         }
     }
 }

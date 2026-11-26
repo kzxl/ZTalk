@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -17,11 +18,12 @@ namespace ZTalk.Client.Services
     {
         private CancellationTokenSource _cts;
         private Task _workerTask;
+        private volatile bool _isRunning;
         private readonly ImageCodecInfo _jpegEncoder;
         private readonly EncoderParameters _encoderParams;
 
         public event Action<byte[]> OnFrameCaptured;
-        public bool IsRunning { get; private set; }
+        public bool IsRunning => _isRunning;
         public string SourceName => "Screen Share";
 
         public ScreenCaptureVideoSource()
@@ -33,30 +35,34 @@ namespace ZTalk.Client.Services
 
         public void Start(int width = 480, int height = 270, int targetFps = 12)
         {
-            if (IsRunning) return;
+            if (_isRunning) return;
 
-            IsRunning = true;
+            _isRunning = true;
             _cts = new CancellationTokenSource();
-            int delayMs = Math.Max(20, 1000 / targetFps);
+            int delayMs = Math.Max(20, 1000 / Math.Max(1, targetFps));
+            var ct = _cts.Token;
 
-            _workerTask = Task.Run(() => CaptureLoop(width, height, delayMs, _cts.Token));
+            _workerTask = Task.Run(() => CaptureLoop(width, height, delayMs, ct));
         }
 
         public void Stop()
         {
-            if (!IsRunning) return;
+            if (!_isRunning) return;
 
-            IsRunning = false;
+            _isRunning = false;
+            var cts = Interlocked.Exchange(ref _cts, null);
             try
             {
-                _cts?.Cancel();
-                _workerTask?.Wait(500);
+                cts?.Cancel();
+                _workerTask?.Wait(1000);
             }
             catch { }
             finally
             {
-                _cts?.Dispose();
-                _cts = null;
+                if (_workerTask == null || _workerTask.IsCompleted)
+                {
+                    cts?.Dispose();
+                }
             }
         }
 
@@ -68,12 +74,14 @@ namespace ZTalk.Client.Services
             using (var screenG = Graphics.FromImage(screenBmp))
             using (var scaledBmp = new Bitmap(targetWidth, targetHeight, PixelFormat.Format24bppRgb))
             using (var scaledG = Graphics.FromImage(scaledBmp))
+            using (var ms = new MemoryStream(32768))
             {
                 scaledG.InterpolationMode = InterpolationMode.Bilinear;
+                var sw = new Stopwatch();
 
-                while (!ct.IsCancellationRequested && IsRunning)
+                while (!ct.IsCancellationRequested && _isRunning)
                 {
-                    var startTime = DateTime.UtcNow;
+                    sw.Restart();
 
                     try
                     {
@@ -83,21 +91,19 @@ namespace ZTalk.Client.Services
                         // 2. Scale về kích thước truyền stream
                         scaledG.DrawImage(screenBmp, 0, 0, targetWidth, targetHeight);
 
-                        // 3. Nén JPEG
-                        using (var ms = new MemoryStream())
-                        {
-                            if (_jpegEncoder != null)
-                                scaledBmp.Save(ms, _jpegEncoder, _encoderParams);
-                            else
-                                scaledBmp.Save(ms, ImageFormat.Jpeg);
+                        // 3. Nén JPEG tái sử dụng MemoryStream
+                        ms.SetLength(0);
+                        ms.Position = 0;
+                        if (_jpegEncoder != null)
+                            scaledBmp.Save(ms, _jpegEncoder, _encoderParams);
+                        else
+                            scaledBmp.Save(ms, ImageFormat.Jpeg);
 
-                            var bytes = ms.ToArray();
-                            OnFrameCaptured?.Invoke(bytes);
-                        }
+                        OnFrameCaptured?.Invoke(ms.ToArray());
                     }
                     catch { }
 
-                    var elapsed = (int)(DateTime.UtcNow - startTime).TotalMilliseconds;
+                    int elapsed = (int)sw.ElapsedMilliseconds;
                     int sleepTime = Math.Max(1, delayMs - elapsed);
                     if (ct.WaitHandle.WaitOne(sleepTime))
                         break;
@@ -107,7 +113,7 @@ namespace ZTalk.Client.Services
 
         private static ImageCodecInfo GetEncoder(ImageFormat format)
         {
-            var codecs = ImageCodecInfo.GetImageDecoders();
+            var codecs = ImageCodecInfo.GetImageEncoders();
             foreach (var codec in codecs)
             {
                 if (codec.FormatID == format.Guid)

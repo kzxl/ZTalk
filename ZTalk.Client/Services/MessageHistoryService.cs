@@ -1,41 +1,62 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Text;
+using ZTalk.Shared.Protocol;
 
 namespace ZTalk.Client.Services
 {
     /// <summary>
-    /// Lưu lịch sử tin nhắn local bằng file JSON.
-    /// Mỗi conversation = 1 file: history_{conversationId}.json
+    /// Lưu lịch sử tin nhắn local bằng file JSON lines (1 JSON object/dòng).
+    /// Mỗi conversation = 1 file: history_{sanitizedId}.json
     /// </summary>
     public class MessageHistoryService : IMessageHistoryService
     {
         private readonly string _historyDir;
+        private readonly string _fullHistoryDirPrefix;
+        private readonly object _ioLock = new object();
 
-        public MessageHistoryService()
+        public MessageHistoryService(string historyDir = null)
         {
-            _historyDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ChatHistory");
+            _historyDir = historyDir ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ChatHistory");
             if (!Directory.Exists(_historyDir))
                 Directory.CreateDirectory(_historyDir);
+
+            string fullDir = Path.GetFullPath(_historyDir);
+            _fullHistoryDirPrefix = fullDir.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
+                ? fullDir
+                : fullDir + Path.DirectorySeparatorChar;
         }
 
         /// <summary>
-        /// Lưu 1 tin nhắn vào file lịch sử
+        /// Lưu 1 tin nhắn vào file lịch sử (JSON chuẩn qua PacketSerializer)
         /// </summary>
         public void SaveMessage(string conversationId, string senderId, string senderName, string content, bool isFile)
         {
             var filePath = GetFilePath(conversationId);
-            var line = string.Format(
-                "{{\"SenderId\":\"{0}\",\"SenderName\":\"{1}\",\"Content\":\"{2}\",\"Timestamp\":\"{3:O}\",\"IsFile\":{4}}}",
-                Escape(senderId), Escape(senderName), Escape(content), DateTime.Now, isFile.ToString().ToLower());
+            var item = new MessageHistoryItem
+            {
+                SenderId = senderId,
+                SenderName = senderName,
+                Content = content,
+                Timestamp = DateTime.Now.ToString("O"),
+                IsFile = isFile
+            };
+
+            var line = PacketSerializer.ToJson(item);
+            if (string.IsNullOrEmpty(line)) return;
 
             try
             {
-                File.AppendAllText(filePath, line + Environment.NewLine, Encoding.UTF8);
+                lock (_ioLock)
+                {
+                    File.AppendAllText(filePath, line + Environment.NewLine, Encoding.UTF8);
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error saving local history: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -44,85 +65,66 @@ namespace ZTalk.Client.Services
         public List<MessageHistoryItem> GetHistory(string conversationId, int limit = 100)
         {
             var result = new List<MessageHistoryItem>();
-            var filePath = GetFilePath(conversationId);
+            if (limit <= 0) return result;
 
+            var filePath = GetFilePath(conversationId);
             if (!File.Exists(filePath))
                 return result;
 
             try
             {
-                var lines = File.ReadAllLines(filePath, Encoding.UTF8);
-                var recent = lines.Skip(Math.Max(0, lines.Length - limit)).Take(limit);
-
-                foreach (var line in recent)
+                string[] lines;
+                lock (_ioLock)
                 {
+                    lines = File.ReadAllLines(filePath, Encoding.UTF8);
+                }
+
+                int start = Math.Max(0, lines.Length - limit);
+                for (int i = start; i < lines.Length; i++)
+                {
+                    var line = lines[i];
                     if (string.IsNullOrWhiteSpace(line)) continue;
 
-                    var item = new MessageHistoryItem
-                    {
-                        SenderId = ExtractField(line, "SenderId"),
-                        SenderName = ExtractField(line, "SenderName"),
-                        Content = ExtractField(line, "Content"),
-                        Timestamp = ExtractField(line, "Timestamp"),
-                        IsFile = ExtractField(line, "IsFile") == "true"
-                    };
-                    result.Add(item);
+                    var item = PacketSerializer.FromJson<MessageHistoryItem>(line);
+                    if (item != null)
+                        result.Add(item);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error reading local history: {ex.Message}");
+            }
 
             return result;
         }
 
         private string GetFilePath(string conversationId)
         {
-            return Path.Combine(_historyDir, $"history_{conversationId}.json");
+            string safeId = SanitizeConversationId(conversationId);
+            string fullPath = Path.GetFullPath(Path.Combine(_historyDir, $"history_{safeId}.json"));
+
+            if (!fullPath.StartsWith(_fullHistoryDirPrefix, StringComparison.OrdinalIgnoreCase))
+                throw new UnauthorizedAccessException("Invalid conversation ID path.");
+
+            return fullPath;
         }
 
-        private string Escape(string s)
+        private static string SanitizeConversationId(string conversationId)
         {
-            if (s == null) return "";
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
-        }
+            if (string.IsNullOrWhiteSpace(conversationId)) return "unknown";
 
-        private string ExtractField(string json, string field)
-        {
-            var search = "\"" + field + "\":";
-            int idx = json.IndexOf(search, StringComparison.Ordinal);
-            if (idx < 0) return null;
-
-            idx += search.Length;
-            while (idx < json.Length && json[idx] == ' ') idx++;
-
-            if (idx >= json.Length) return null;
-
-            if (json[idx] == '"')
+            var sb = new StringBuilder(conversationId.Length);
+            for (int i = 0; i < conversationId.Length; i++)
             {
-                idx++;
-                var sb = new StringBuilder();
-                bool escaped = false;
-                while (idx < json.Length)
-                {
-                    char c = json[idx];
-                    if (escaped) { sb.Append(c); escaped = false; }
-                    else if (c == '\\') { escaped = true; }
-                    else if (c == '"') { break; }
-                    else { sb.Append(c); }
-                    idx++;
-                }
-                return sb.ToString();
+                char c = conversationId[i];
+                if (char.IsLetterOrDigit(c) || c == '_' || c == '-')
+                    sb.Append(c);
+                else
+                    sb.Append('_');
             }
-            else
-            {
-                // Boolean or number
-                var sb = new StringBuilder();
-                while (idx < json.Length && json[idx] != ',' && json[idx] != '}')
-                {
-                    sb.Append(json[idx]);
-                    idx++;
-                }
-                return sb.ToString().Trim();
-            }
+
+            string result = sb.ToString();
+            return result.Length > 64 ? result.Substring(0, 64) : result;
         }
     }
 }

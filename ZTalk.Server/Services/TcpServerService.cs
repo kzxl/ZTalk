@@ -15,21 +15,26 @@ namespace ZTalk.Server.Services
 {
     /// <summary>
     /// TCP Server xử lý nhiều client đồng thời.
-    /// Mỗi client kết nối → chạy trong Task riêng (async).
+    /// Mỗi client kết nối → chạy async I/O (IOCP) qua NetworkStream.ReadAsync.
     /// </summary>
-    public class TcpServerService : ITcpServerService
+    public class TcpServerService : ITcpServerService, IDisposable
     {
+        private const int PreAuthMaxPacketSize = 65536;
+
         private TcpListener _listener;
         private CancellationTokenSource _cts;
+        private readonly object _lifecycleLock = new object();
         private readonly ConcurrentDictionary<string, ConnectedClient> _clients;
         private readonly AuthService _authService;
         private readonly MessageRouter _messageRouter;
         private readonly MessageStore _messageStore;
         private int _connectionCounter;
+        private int _totalMessagesRouted;
+        private volatile bool _isRunning;
 
-        public bool IsRunning { get; private set; }
+        public bool IsRunning => _isRunning;
         public int ConnectedCount => _clients.Count;
-        public int TotalMessagesRouted { get; private set; }
+        public int TotalMessagesRouted => Volatile.Read(ref _totalMessagesRouted);
         public DateTime? StartTime { get; private set; }
 
         public event Action<string> OnLog;
@@ -53,18 +58,23 @@ namespace ZTalk.Server.Services
         /// </summary>
         public void Start(int port)
         {
-            if (IsRunning) return;
+            lock (_lifecycleLock)
+            {
+                if (_isRunning) return;
 
-            _cts = new CancellationTokenSource();
-            _listener = new TcpListener(IPAddress.Any, port);
-            _listener.Start();
-            IsRunning = true;
-            StartTime = DateTime.Now;
+                _cts?.Dispose();
+                _cts = new CancellationTokenSource();
+                _listener = new TcpListener(IPAddress.Any, port);
+                _listener.Start();
+                _isRunning = true;
+                StartTime = DateTime.Now;
+                Interlocked.Exchange(ref _totalMessagesRouted, 0);
 
-            Log($"Server started on port {port}");
+                Log($"Server started on port {port}");
 
-            // Accept connections in background
-            Task.Run(() => AcceptClientsAsync(_cts.Token));
+                var ct = _cts.Token;
+                Task.Run(() => AcceptClientsAsync(ct));
+            }
         }
 
         /// <summary>
@@ -72,27 +82,32 @@ namespace ZTalk.Server.Services
         /// </summary>
         public void Stop()
         {
-            if (!IsRunning) return;
-
-            _cts?.Cancel();
-            IsRunning = false;
-
-            // Disconnect all clients
-            foreach (var kvp in _clients)
+            CancellationTokenSource ctsToDispose = null;
+            lock (_lifecycleLock)
             {
+                if (!_isRunning) return;
+
+                _isRunning = false;
+                ctsToDispose = _cts;
+                _cts = null;
+
+                try { ctsToDispose?.Cancel(); } catch { }
+
+                // Disconnect all clients
+                foreach (var kvp in _clients)
+                {
+                    CloseClientQuietly(kvp.Value);
+                }
+                _clients.Clear();
+
                 try
                 {
-                    kvp.Value.TcpClient?.Close();
+                    _listener?.Stop();
                 }
                 catch { }
             }
-            _clients.Clear();
 
-            try
-            {
-                _listener?.Stop();
-            }
-            catch { }
+            ctsToDispose?.Dispose();
 
             Log("Server stopped");
             OnClientListChanged?.Invoke();
@@ -107,7 +122,9 @@ namespace ZTalk.Server.Services
             {
                 try
                 {
-                    var tcpClient = await _listener.AcceptTcpClientAsync();
+                    var tcpClient = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
+                    tcpClient.NoDelay = true;
+
                     var connectionId = "conn_" + Interlocked.Increment(ref _connectionCounter);
 
                     var client = new ConnectedClient
@@ -116,12 +133,13 @@ namespace ZTalk.Server.Services
                         Stream = tcpClient.GetStream(),
                         UserId = connectionId
                     };
+                    client.CacheEndPoint();
 
                     _clients.TryAdd(connectionId, client);
                     Log($"[CONNECT] New client connected: {client.EndPoint} (ID: {connectionId})");
                     OnClientListChanged?.Invoke();
 
-                    // Xử lý client trong Task riêng
+                    // Handle client asynchronously using IOCP reads
                     var _ = Task.Run(() => HandleClientAsync(connectionId, client, ct));
                 }
                 catch (ObjectDisposedException)
@@ -137,46 +155,51 @@ namespace ZTalk.Server.Services
         }
 
         /// <summary>
-        /// Xử lý 1 client: đọc packet và route
+        /// Xử lý 1 client: đọc packet bất đồng bộ và route
         /// </summary>
         private async Task HandleClientAsync(string connectionId, ConnectedClient client, CancellationToken ct)
         {
             try
             {
-                while (!ct.IsCancellationRequested && client.TcpClient.Connected)
+                while (!ct.IsCancellationRequested && client.TcpClient != null && client.TcpClient.Connected)
                 {
-                    var packet = await Task.Run(() => PacketSerializer.ReceivePacket(client.Stream));
+                    int maxSize = client.IsAuthenticated ? AppConstants.MaxPacketSize : PreAuthMaxPacketSize;
+                    var packet = await PacketSerializer.ReceivePacketAsync(client.Stream, ct, maxSize).ConfigureAwait(false);
                     if (packet == null)
-                        break; // Client disconnected
+                        break; // Client disconnected or invalid packet
 
-                    ProcessPacket(connectionId, client, packet);
+                    if (!ProcessPacket(connectionId, client, packet, ct))
+                        break; // Client requested disconnect
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // Server shutting down
             }
             catch (Exception ex)
             {
                 if (!ct.IsCancellationRequested)
-                    Log($"[ERROR] Client {connectionId}: {ex.Message}");
+                    Log($"[ERROR] Client {client.UserId ?? connectionId}: {ex.Message}");
             }
             finally
             {
-                // Dùng client.UserId thay vì connectionId cũ 
-                // (vì HandleLogin đổi key từ conn_X → userId)
-                DisconnectClient(client.UserId ?? connectionId);
+                // Remove by active key (UserId after login, connectionId before login)
+                DisconnectClient(client.UserId ?? connectionId, client);
             }
         }
 
         /// <summary>
-        /// Xử lý packet nhận được từ client
+        /// Xử lý packet nhận được từ client. Trả về false nếu cần đóng kết nối.
         /// </summary>
-        private void ProcessPacket(string connectionId, ConnectedClient client, Packet packet)
+        private bool ProcessPacket(string connectionId, ConnectedClient client, Packet packet, CancellationToken ct)
         {
-            client.PacketsReceived++;
-            TotalMessagesRouted++;
+            client.IncrementPacketsReceived();
+            Interlocked.Increment(ref _totalMessagesRouted);
 
             switch (packet.Type)
             {
                 case PacketType.Login:
-                    HandleLogin(connectionId, client, packet);
+                    HandleLogin(connectionId, client, packet, ct);
                     break;
 
                 case PacketType.Register:
@@ -185,9 +208,11 @@ namespace ZTalk.Server.Services
 
                 case PacketType.Message:
                 case PacketType.GroupMessage:
-                    // Forward + lưu lịch sử
-                    HandleForward(client, packet);
-                    SaveMessageToStore(client, packet);
+                    // Only forward & persist authenticated messages
+                    if (HandleForward(client, packet))
+                    {
+                        SaveMessageToStore(client, packet);
+                    }
                     break;
 
                 case PacketType.TypingIndicator:
@@ -207,47 +232,68 @@ namespace ZTalk.Server.Services
                     break;
 
                 case PacketType.ChatHistoryRequest:
-                    HandleChatHistoryRequest(connectionId, client, packet);
+                    HandleChatHistoryRequest(client, packet);
                     break;
 
                 case PacketType.Heartbeat:
-                    // Client yêu cầu cập nhật danh sách user
+                    // Reply with online user list only to requesting client (avoids O(N²) broadcast storm)
                     if (client.IsAuthenticated)
                     {
-                        _messageRouter.BroadcastUserList();
+                        _messageRouter.SendUserListToClient(client);
                     }
                     break;
 
                 case PacketType.Disconnect:
-                    DisconnectClient(connectionId);
-                    break;
+                    DisconnectClient(client.UserId ?? connectionId, client);
+                    return false;
 
                 default:
-                    Log($"[WARN] Unknown packet type: {packet.Type} from {connectionId}");
+                    Log($"[WARN] Unknown packet type: {packet.Type} from {client.UserId ?? connectionId}");
                     break;
             }
+
+            return true;
         }
 
         /// <summary>
         /// Xử lý đăng nhập
         /// </summary>
-        private void HandleLogin(string connectionId, ConnectedClient client, Packet packet)
+        private void HandleLogin(string connectionId, ConnectedClient client, Packet packet, CancellationToken ct)
         {
+            if (client.IsAuthenticated)
+            {
+                var alreadyLoggedIn = new LoginResponseDTO
+                {
+                    Success = false,
+                    Message = "Client is already authenticated"
+                };
+                client.SendPacket(new Packet(PacketType.LoginResponse, "server", client.UserId, PacketSerializer.ToJson(alreadyLoggedIn)));
+                return;
+            }
+
             var request = PacketSerializer.FromJson<LoginRequestDTO>(packet.Data) ?? new LoginRequestDTO();
             var response = _authService.Authenticate(request);
 
             if (response.Success)
             {
-                // Update client info
+                // Remove temporary connection key
                 ConnectedClient removed;
                 _clients.TryRemove(connectionId, out removed);
+
+                // Replace any stale session for the same UserId cleanly
+                ConnectedClient existingSession;
+                if (_clients.TryRemove(response.UserId, out existingSession) && !ReferenceEquals(existingSession, client))
+                {
+                    Log($"[LOGIN] Replacing existing session for '{request.Username}' (ID: {response.UserId})");
+                    CloseClientQuietly(existingSession);
+                }
 
                 client.UserId = response.UserId;
                 client.Username = request.Username;
                 client.DisplayName = response.DisplayName;
                 client.IsAuthenticated = true;
 
-                _clients.TryAdd(response.UserId, client);
+                _clients[response.UserId] = client;
 
                 Log($"[LOGIN] User '{request.Username}' authenticated successfully (ID: {response.UserId})");
             }
@@ -256,19 +302,23 @@ namespace ZTalk.Server.Services
                 Log($"[LOGIN FAILED] {request.Username}: {response.Message}");
             }
 
-            // Send response back to client
+            // Send response back to client (thread-safe)
             var responseData = PacketSerializer.ToJson(response);
             var responsePacket = new Packet(PacketType.LoginResponse, "server", connectionId, responseData);
-            PacketSerializer.SendPacket(client.Stream, responsePacket);
-            client.PacketsSent++;
+            client.SendPacket(responsePacket);
 
             if (response.Success)
             {
                 // Brief delay to allow client to open frmChat and subscribe to events
                 Task.Run(async () =>
                 {
-                    await Task.Delay(500);
-                    _messageRouter.BroadcastUserList();
+                    try
+                    {
+                        await Task.Delay(500, ct).ConfigureAwait(false);
+                        if (!ct.IsCancellationRequested)
+                            _messageRouter.BroadcastUserList();
+                    }
+                    catch (OperationCanceledException) { }
                 });
                 OnClientListChanged?.Invoke();
             }
@@ -284,8 +334,7 @@ namespace ZTalk.Server.Services
             var responseData = PacketSerializer.ToJson(response);
 
             var responsePacket = new Packet(PacketType.RegisterResponse, "server", connectionId, responseData);
-            PacketSerializer.SendPacket(client.Stream, responsePacket);
-            client.PacketsSent++;
+            client.SendPacket(responsePacket);
 
             Log($"[REGISTER] {request.Username}: {response.Message}");
         }
@@ -293,15 +342,15 @@ namespace ZTalk.Server.Services
         /// <summary>
         /// Forward packet from sender to receiver
         /// </summary>
-        private void HandleForward(ConnectedClient sender, Packet packet)
+        private bool HandleForward(ConnectedClient sender, Packet packet)
         {
             if (!sender.IsAuthenticated)
             {
                 Log($"[WARN] Unauthenticated client tried to send {packet.Type}");
-                return;
+                return false;
             }
 
-            // Set sender info
+            // Always overwrite SenderId with authenticated UserId to prevent spoofing
             packet.SenderId = sender.UserId;
 
             if (string.IsNullOrEmpty(packet.ReceiverId))
@@ -314,6 +363,8 @@ namespace ZTalk.Server.Services
                 // Point-to-point
                 _messageRouter.SendToClient(packet.ReceiverId, packet);
             }
+
+            return true;
         }
 
         /// <summary>
@@ -321,10 +372,27 @@ namespace ZTalk.Server.Services
         /// </summary>
         public void DisconnectClient(string connectionId)
         {
+            DisconnectClient(connectionId, null);
+        }
+
+        private void DisconnectClient(string connectionId, ConnectedClient expectedClient)
+        {
+            if (string.IsNullOrEmpty(connectionId)) return;
+
             ConnectedClient client;
+            if (expectedClient != null)
+            {
+                // Ensure a closing replaced session does not kick the newly logged-in session
+                if (!_clients.TryGetValue(connectionId, out client) || !ReferenceEquals(client, expectedClient))
+                {
+                    CloseClientQuietly(expectedClient);
+                    return;
+                }
+            }
+
             if (_clients.TryRemove(connectionId, out client))
             {
-                try { client.TcpClient?.Close(); } catch { }
+                CloseClientQuietly(client);
 
                 Log($"[DISCONNECT] Client disconnected: {client.DisplayName ?? client.Username ?? connectionId}");
 
@@ -337,16 +405,25 @@ namespace ZTalk.Server.Services
             }
         }
 
+        private static void CloseClientQuietly(ConnectedClient client)
+        {
+            if (client == null) return;
+            try { client.Stream?.Close(); } catch { }
+            try { client.TcpClient?.Close(); } catch { }
+        }
+
         private void Log(string message)
         {
             OnLog?.Invoke($"[{DateTime.Now:HH:mm:ss}] {message}");
         }
 
         /// <summary>
-        /// Save message to store
+        /// Save authenticated message to store
         /// </summary>
         private void SaveMessageToStore(ConnectedClient sender, Packet packet)
         {
+            if (!sender.IsAuthenticated) return;
+
             if (packet.Type == PacketType.Message || packet.Type == PacketType.GroupMessage)
             {
                 var msg = PacketSerializer.FromJson<MessageDTO>(packet.Data);
@@ -354,14 +431,14 @@ namespace ZTalk.Server.Services
                 if (string.IsNullOrEmpty(content)) return;
 
                 string receiverId = packet.Type == PacketType.GroupMessage ? "__group__" : packet.ReceiverId;
-                _messageStore.SaveMessage(packet.SenderId, receiverId, sender.DisplayName ?? packet.SenderId, content, false);
+                _messageStore.SaveMessage(sender.UserId, receiverId, sender.DisplayName ?? sender.UserId, content, false);
             }
         }
 
         /// <summary>
         /// Handle history request
         /// </summary>
-        private void HandleChatHistoryRequest(string connectionId, ConnectedClient client, Packet packet)
+        private void HandleChatHistoryRequest(ConnectedClient client, Packet packet)
         {
             if (!client.IsAuthenticated) return;
 
@@ -369,16 +446,20 @@ namespace ZTalk.Server.Services
             int maxCount = 50;
 
             var history = _messageStore.GetHistory(client.UserId, partnerId, maxCount);
-            var historyPayload = new System.Collections.Generic.Dictionary<string, object>
+            var historyPayload = new Dictionary<string, object>
             {
                 { "PartnerId", partnerId },
                 { "Messages", history }
             };
 
             var response = new Packet(PacketType.ChatHistoryResponse, "SERVER", client.UserId, PacketSerializer.ToJson(historyPayload));
-            PacketSerializer.SendPacket(client.Stream, response);
-            client.PacketsSent++;
+            client.SendPacket(response);
             Log($"Sent {history.Count} history messages to {client.DisplayName} (partner: {partnerId})");
+        }
+
+        public void Dispose()
+        {
+            Stop();
         }
     }
 }

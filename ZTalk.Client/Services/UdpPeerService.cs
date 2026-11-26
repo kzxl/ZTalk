@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using ZTalk.Shared.Network;
@@ -13,10 +14,13 @@ namespace ZTalk.Client.Services
     /// </summary>
     public class UdpPeerService : IDisposable
     {
+        private static readonly byte[] PingPayload = Encoding.UTF8.GetBytes("CHATBOX_PING");
+        private static readonly byte[] PongPayload = Encoding.UTF8.GetBytes("CHATBOX_PONG");
+
         private UdpClient _udpClient;
         private CancellationTokenSource _cts;
-        private IPEndPoint _peerEndPoint;
-        private bool _isConnected;
+        private volatile IPEndPoint _peerEndPoint;
+        private volatile bool _isConnected;
         private readonly object _lock = new object();
 
         /// <summary>Local UDP port đang lắng nghe</summary>
@@ -61,51 +65,57 @@ namespace ZTalk.Client.Services
             string peerPublicIp, int peerPublicPort,
             string peerLocalIp, int peerLocalPort)
         {
-            _cts = new CancellationTokenSource();
+            if (_udpClient == null) return false;
+
+            ReplaceCts();
+            var ct = _cts.Token;
             _isConnected = false;
 
-            // Endpoints to try
-            IPEndPoint publicEp = null;
-            IPEndPoint localEp = null;
-
-            if (!string.IsNullOrEmpty(peerPublicIp) && peerPublicPort > 0)
-                publicEp = new IPEndPoint(IPAddress.Parse(peerPublicIp), peerPublicPort);
-
-            if (!string.IsNullOrEmpty(peerLocalIp) && peerLocalPort > 0)
-                localEp = new IPEndPoint(IPAddress.Parse(peerLocalIp), peerLocalPort);
+            // Safely parse peer endpoints
+            IPEndPoint publicEp = TryParseEndPoint(peerPublicIp, peerPublicPort);
+            IPEndPoint localEp = TryParseEndPoint(peerLocalIp, peerLocalPort);
 
             // Start listening for pings
-            var listenTask = Task.Run(() => ListenForPing(_cts.Token));
-
-            // Send pings to both endpoints
-            var pingData = System.Text.Encoding.UTF8.GetBytes("CHATBOX_PING");
-            var pongData = System.Text.Encoding.UTF8.GetBytes("CHATBOX_PONG");
+            var listenTask = Task.Run(() => ListenForPing(ct));
 
             int attempts = 0;
-            while (!_isConnected && attempts < 25) // 25 x 200ms = 5 seconds
+            while (!_isConnected && !ct.IsCancellationRequested && attempts < 25) // 25 x 200ms = 5 seconds
             {
                 try
                 {
-                    // Ping public endpoint
                     if (publicEp != null)
-                        _udpClient.Send(pingData, pingData.Length, publicEp);
+                        _udpClient.Send(PingPayload, PingPayload.Length, publicEp);
 
-                    // Ping local endpoint
                     if (localEp != null)
-                        _udpClient.Send(pingData, pingData.Length, localEp);
+                        _udpClient.Send(PingPayload, PingPayload.Length, localEp);
                 }
                 catch { }
 
-                await Task.Delay(200);
+                try { await Task.Delay(200, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { break; }
+
                 attempts++;
             }
 
             if (!_isConnected)
             {
-                _cts.Cancel();
+                try { _cts?.Cancel(); } catch { }
             }
 
+            // Ensure ListenForPing exits before caller invokes StartReceiving()
+            try { await listenTask.ConfigureAwait(false); } catch { }
+
             return _isConnected;
+        }
+
+        private static IPEndPoint TryParseEndPoint(string ip, int port)
+        {
+            IPAddress parsed;
+            if (!string.IsNullOrEmpty(ip) && port > 0 && port <= 65535 && IPAddress.TryParse(ip, out parsed))
+            {
+                return new IPEndPoint(parsed, port);
+            }
+            return null;
         }
 
         /// <summary>
@@ -113,17 +123,20 @@ namespace ZTalk.Client.Services
         /// </summary>
         private void ListenForPing(CancellationToken ct)
         {
-            var pongData = System.Text.Encoding.UTF8.GetBytes("CHATBOX_PONG");
+            try
+            {
+                _udpClient.Client.ReceiveTimeout = 500;
+            }
+            catch { return; }
+
+            var remoteEp = new IPEndPoint(IPAddress.Any, 0);
 
             while (!ct.IsCancellationRequested && !_isConnected)
             {
                 try
                 {
-                    _udpClient.Client.ReceiveTimeout = 500;
-                    var remoteEp = new IPEndPoint(IPAddress.Any, 0);
                     var data = _udpClient.Receive(ref remoteEp);
-
-                    var message = System.Text.Encoding.UTF8.GetString(data);
+                    var message = Encoding.UTF8.GetString(data);
 
                     if (message == "CHATBOX_PING" || message == "CHATBOX_PONG")
                     {
@@ -133,7 +146,7 @@ namespace ZTalk.Client.Services
                         // Reply pong
                         if (message == "CHATBOX_PING")
                         {
-                            _udpClient.Send(pongData, pongData.Length, remoteEp);
+                            _udpClient.Send(PongPayload, PongPayload.Length, remoteEp);
                         }
 
                         OnConnected?.Invoke();
@@ -156,22 +169,28 @@ namespace ZTalk.Client.Services
         /// </summary>
         public void StartReceiving()
         {
-            if (!_isConnected) return;
+            if (!_isConnected || _udpClient == null) return;
 
-            _cts = new CancellationTokenSource();
-            Task.Run(() => ReceiveLoop(_cts.Token));
+            ReplaceCts();
+            var ct = _cts.Token;
+            Task.Run(() => ReceiveLoop(ct));
         }
 
         private void ReceiveLoop(CancellationToken ct)
         {
+            try
+            {
+                _udpClient.Client.ReceiveTimeout = 5000;
+            }
+            catch { return; }
+
+            var remoteEp = new IPEndPoint(IPAddress.Any, 0);
+
             while (!ct.IsCancellationRequested && _isConnected)
             {
                 try
                 {
-                    _udpClient.Client.ReceiveTimeout = 5000;
-                    var remoteEp = new IPEndPoint(IPAddress.Any, 0);
                     var data = _udpClient.Receive(ref remoteEp);
-
                     if (data.Length > 0)
                     {
                         OnDataReceived?.Invoke(data);
@@ -195,15 +214,28 @@ namespace ZTalk.Client.Services
         /// </summary>
         public void SendData(byte[] data)
         {
-            if (!_isConnected || _peerEndPoint == null) return;
+            var peerEp = _peerEndPoint;
+            var client = _udpClient;
+            if (!_isConnected || peerEp == null || client == null || data == null || data.Length == 0 || data.Length > 65507)
+                return;
 
             lock (_lock)
             {
                 try
                 {
-                    _udpClient.Send(data, data.Length, _peerEndPoint);
+                    client.Send(data, data.Length, peerEp);
                 }
                 catch { }
+            }
+        }
+
+        private void ReplaceCts()
+        {
+            var old = Interlocked.Exchange(ref _cts, new CancellationTokenSource());
+            if (old != null)
+            {
+                try { old.Cancel(); } catch { }
+                try { old.Dispose(); } catch { }
             }
         }
 
@@ -213,13 +245,19 @@ namespace ZTalk.Client.Services
         public void Stop()
         {
             _isConnected = false;
-            _cts?.Cancel();
+            var old = Interlocked.Exchange(ref _cts, null);
+            if (old != null)
+            {
+                try { old.Cancel(); } catch { }
+                try { old.Dispose(); } catch { }
+            }
         }
 
         public void Dispose()
         {
             Stop();
-            try { _udpClient?.Close(); } catch { }
+            var client = Interlocked.Exchange(ref _udpClient, null);
+            try { client?.Close(); } catch { }
         }
     }
 }

@@ -42,6 +42,9 @@ namespace ZTalk.Shared.Crypto
         /// </summary>
         public byte[] EncryptBytes(byte[] data, byte[] key)
         {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            if (key == null || key.Length == 0) throw new ArgumentException("Key cannot be null or empty.", nameof(key));
+
             using (var aes = Aes.Create())
             {
                 aes.KeySize = 256;
@@ -50,8 +53,9 @@ namespace ZTalk.Shared.Crypto
                 aes.Key = EnsureKeySize(key, 32); // 256 bits
                 aes.GenerateIV();
 
+                int paddedLen = ((data.Length / 16) + 1) * 16;
                 using (var encryptor = aes.CreateEncryptor())
-                using (var ms = new MemoryStream())
+                using (var ms = new MemoryStream(16 + paddedLen))
                 {
                     // Ghi IV vào đầu stream
                     ms.Write(aes.IV, 0, aes.IV.Length);
@@ -72,6 +76,11 @@ namespace ZTalk.Shared.Crypto
         /// </summary>
         public byte[] DecryptBytes(byte[] data, byte[] key)
         {
+            if (data == null || data.Length < 16)
+                throw new ArgumentException("Encrypted data must contain at least a 16-byte IV.", nameof(data));
+            if (key == null || key.Length == 0)
+                throw new ArgumentException("Key cannot be null or empty.", nameof(key));
+
             using (var aes = Aes.Create())
             {
                 aes.KeySize = 256;
@@ -81,13 +90,14 @@ namespace ZTalk.Shared.Crypto
 
                 // Tách IV từ 16 bytes đầu
                 var iv = new byte[16];
-                Array.Copy(data, 0, iv, 0, 16);
+                Buffer.BlockCopy(data, 0, iv, 0, 16);
                 aes.IV = iv;
 
+                int cipherLen = data.Length - 16;
                 using (var decryptor = aes.CreateDecryptor())
-                using (var ms = new MemoryStream(data, 16, data.Length - 16))
+                using (var ms = new MemoryStream(data, 16, cipherLen))
                 using (var cs = new CryptoStream(ms, decryptor, CryptoStreamMode.Read))
-                using (var output = new MemoryStream())
+                using (var output = new MemoryStream(cipherLen))
                 {
                     cs.CopyTo(output);
                     return output.ToArray();

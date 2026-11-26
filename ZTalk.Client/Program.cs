@@ -14,16 +14,22 @@ namespace ZTalk.Client
             string autoLoginUser = args != null && args.Length > 0 ? args[0] : null;
 
             // 1. Hiển thị form đăng nhập
-            var loginForm = new Forms.frmLogin(autoLoginUser);
-            var result = loginForm.ShowDialog();
-
-            if (result == DialogResult.OK)
+            using (var loginForm = new Forms.frmLogin(autoLoginUser))
             {
-                // 2. Đăng nhập thành công → mở form chat
-                Application.Run(new Forms.frmChat(
-                    loginForm.TcpService,
-                    loginForm.LoggedInUserId,
-                    loginForm.LoggedInDisplayName));
+                var result = loginForm.ShowDialog();
+
+                if (result == DialogResult.OK)
+                {
+                    // 2. Đăng nhập thành công → mở form chat
+                    Application.Run(new Forms.frmChat(
+                        loginForm.TcpService,
+                        loginForm.LoggedInUserId,
+                        loginForm.LoggedInDisplayName));
+                }
+                else
+                {
+                    loginForm.TcpService?.Dispose();
+                }
             }
         }
     }

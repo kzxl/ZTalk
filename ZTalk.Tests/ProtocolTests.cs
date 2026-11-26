@@ -1,4 +1,7 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Threading.Tasks;
 using ZTalk.Shared.Protocol;
 
 namespace ZTalk.Tests
@@ -10,6 +13,7 @@ namespace ZTalk.Tests
             TestPacketFraming();
             TestJsonSerializationSpecialCharacters();
             TestPacketHeaderParsing();
+            TestFramePacketAndConcurrentSerialization();
         }
 
         private static void TestPacketFraming()
@@ -56,6 +60,34 @@ namespace ZTalk.Tests
             Assert.Equal(PacketType.Login, parsed.Type);
             Assert.Equal("testuser", parsed.SenderId);
             Assert.Equal("{\"Username\":\"test\"}", parsed.Data);
+        }
+
+        private static void TestFramePacketAndConcurrentSerialization()
+        {
+            var packet = new Packet(PacketType.Message, "alice", "bob", "Single-buffer frame test 🚀");
+            byte[] frame = PacketSerializer.FramePacket(packet);
+
+            Assert.NotNull(frame);
+            Assert.True(frame.Length > 4);
+
+            int declaredLen = (frame[0] << 24) | (frame[1] << 16) | (frame[2] << 8) | frame[3];
+            Assert.Equal(frame.Length - 4, declaredLen, "4-byte BigEndian length prefix must match UTF-8 payload length");
+
+            string decodedJson = Encoding.UTF8.GetString(frame, 4, declaredLen);
+            var restored = PacketSerializer.Deserialize(decodedJson);
+            Assert.NotNull(restored);
+            Assert.Equal(packet.Data, restored.Data);
+
+            // Multi-threaded serialization stress check (ThreadLocal<JavaScriptSerializer>)
+            Parallel.For(0, 64, i =>
+            {
+                var p = new Packet(PacketType.Message, "u" + i, "u" + (i + 1), "Payload #" + i);
+                var f = PacketSerializer.FramePacket(p);
+                int len = (f[0] << 24) | (f[1] << 16) | (f[2] << 8) | f[3];
+                var back = PacketSerializer.Deserialize(Encoding.UTF8.GetString(f, 4, len));
+                Assert.NotNull(back);
+                Assert.Equal(p.Data, back.Data);
+            });
         }
     }
 }

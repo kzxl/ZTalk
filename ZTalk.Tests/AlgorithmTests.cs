@@ -30,12 +30,14 @@ namespace ZTalk.Tests
             TestStunXorMappedAddress_ValidIPv4Payload_DecodesCorrectIpAndPort();
             TestStunParseResponse_MismatchedTransactionId_ReturnsNull();
             TestStunParseResponse_MalformedOrTruncatedBuffer_ReturnsNull();
+            TestStunParseResponse_DeclaredLengthExceedsBuffer_ReturnsNull();
         }
 
         public static void RunChunkingTests()
         {
             TestChunking_BoundaryPayloadSizes_CalculatesExactChunkCount();
             TestChunkReassembly_OutOfOrderArrival_ProducesByteIdenticalFile();
+            TestFileReceive_PathTraversalAndIncompleteChunks_HandledSafely();
         }
 
         public static void RunCryptoInvariantTests()
@@ -144,6 +146,23 @@ namespace ZTalk.Tests
             Assert.True(StunClient.ParseBindingResponse(wrongCookie, txId) == null);
         }
 
+        private static void TestStunParseResponse_DeclaredLengthExceedsBuffer_ReturnsNull()
+        {
+            var txId = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+            var packet = new byte[28];
+            packet[0] = 0x01; packet[1] = 0x01; // Binding Response
+            packet[2] = 0xFF; packet[3] = 0xFF; // Malicious msgLength = 65535 > buffer size
+            packet[4] = 0x21; packet[5] = 0x12; packet[6] = 0xA4; packet[7] = 0x42;
+            Array.Copy(txId, 0, packet, 8, 12);
+
+            // Attribute declaring length 200 inside 28-byte buffer
+            packet[20] = 0x00; packet[21] = 0x20;
+            packet[22] = 0x00; packet[23] = 0xC8;
+
+            var result = StunClient.ParseBindingResponse(packet, txId);
+            Assert.True(result == null, "STUN parser must safely return null instead of reading out of bounds");
+        }
+
         #endregion
 
         #region Category 2: File Chunking & Out-of-Order Reassembly Algorithm
@@ -222,6 +241,38 @@ namespace ZTalk.Tests
             {
                 if (File.Exists(savedPath))
                     File.Delete(savedPath);
+            }
+        }
+
+        private static void TestFileReceive_PathTraversalAndIncompleteChunks_HandledSafely()
+        {
+            string tempDownloadDir = Path.Combine(Path.GetTempPath(), $"ztalk_dl_{Guid.NewGuid():N}");
+            try
+            {
+                var receiver = new FileReceiveService(tempDownloadDir);
+
+                // 1. Path traversal attempt must be sanitized inside tempDownloadDir
+                string t1 = "trav_01";
+                receiver.HandleFileHeader("s1", "Attacker", @"..\..\evil_payload.txt", 4, 1, t1);
+                receiver.HandleFileChunk(t1, 0, Convert.ToBase64String(new byte[] { 1, 2, 3, 4 }));
+                string saved = receiver.HandleFileComplete(t1);
+
+                Assert.NotNull(saved);
+                string fullDir = Path.GetFullPath(tempDownloadDir) + Path.DirectorySeparatorChar;
+                Assert.True(Path.GetFullPath(saved).StartsWith(fullDir, StringComparison.OrdinalIgnoreCase),
+                    "Saved file must never escape download directory");
+                Assert.Equal("evil_payload.txt", Path.GetFileName(saved));
+
+                // 2. Incomplete transfer (missing chunk 1 of 2) must return null
+                string t2 = "inc_02";
+                receiver.HandleFileHeader("s1", "Alice", "partial.bin", 10, 2, t2);
+                receiver.HandleFileChunk(t2, 0, Convert.ToBase64String(new byte[] { 1, 2, 3, 4, 5 }));
+                string incompleteSaved = receiver.HandleFileComplete(t2);
+                Assert.True(incompleteSaved == null, "Incomplete transfer with missing chunks must be rejected");
+            }
+            finally
+            {
+                if (Directory.Exists(tempDownloadDir)) Directory.Delete(tempDownloadDir, true);
             }
         }
 
@@ -337,6 +388,7 @@ namespace ZTalk.Tests
             TestVoiceCall_AudioFrameHeader_SerializationRoundTrip();
             TestVoiceCall_SilenceSuppression_DropsSilenceFrames();
             TestVoiceCall_ActiveAudio_SendsPacketAndTracksLoss();
+            TestVoiceCall_LargePayloadAndOutOfOrderSequence();
         }
 
         private static void TestVoiceCall_AudioFrameHeader_SerializationRoundTrip()
@@ -407,6 +459,44 @@ namespace ZTalk.Tests
             Assert.True(processed);
             Assert.NotNull(receivedAudio);
             Assert.Equal((uint)1, receivedHeader.SequenceNumber);
+        }
+
+        private static void TestVoiceCall_LargePayloadAndOutOfOrderSequence()
+        {
+            // PayloadSize > Int16.MaxValue (32767) must survive unsigned 16-bit header round-trip
+            var header = new AudioFrameHeader
+            {
+                SequenceNumber = 5,
+                TimestampMs = 123456,
+                SampleRate = 48000,
+                Channels = 2,
+                PayloadSize = 40000,
+                IsVoiceDetected = true
+            };
+            var decoded = AudioFrameHeader.Deserialize(header.Serialize());
+            Assert.Equal(40000, decoded.PayloadSize, "PayloadSize > 32767 must not overflow signed Int16");
+
+            // Truncated 17-byte packet must be safely ignored
+            var session = new VoiceCallSessionService();
+            Assert.False(session.ProcessIncomingAudioPacket(new byte[17]));
+
+            // Out-of-order delivery: seq 1, then seq 3 (1 lost), then late seq 2, then seq 4 (0 more lost)
+            byte[] MakePacket(uint seq)
+            {
+                var h = new AudioFrameHeader { SequenceNumber = seq, PayloadSize = 4, IsVoiceDetected = true };
+                var pkt = new byte[AudioFrameHeader.HeaderSize + 4];
+                h.WriteTo(pkt, 0);
+                return pkt;
+            }
+
+            Assert.True(session.ProcessIncomingAudioPacket(MakePacket(1)));
+            Assert.True(session.ProcessIncomingAudioPacket(MakePacket(3)));
+            Assert.Equal(1L, session.PacketsLost);
+
+            // Late packet seq 2 arrives -> must NOT rewind expected sequence watermark
+            Assert.True(session.ProcessIncomingAudioPacket(MakePacket(2)));
+            Assert.True(session.ProcessIncomingAudioPacket(MakePacket(4)));
+            Assert.Equal(1L, session.PacketsLost, "Out-of-order late packet must not cause false packet loss on next sequence");
         }
 
         #endregion
