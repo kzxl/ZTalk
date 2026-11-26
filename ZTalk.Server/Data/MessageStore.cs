@@ -3,12 +3,14 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using ZTalk.Shared.Crypto;
 
 namespace ZTalk.Server.Data
 {
     /// <summary>
     /// Lưu trữ lịch sử tin nhắn trên server.
-    /// Mỗi conversation (userId1_userId2) lưu vào 1 file JSON với per-conversation cache + lock.
+    /// Mỗi conversation (userId1_userId2) lưu vào 1 file JSON với per-conversation cache + lock
+    /// và tùy chọn mã hóa AEAD trên đĩa (StorageCipher).
     /// Group chat lưu riêng file __group__.json.
     /// </summary>
     public class MessageStore
@@ -17,12 +19,14 @@ namespace ZTalk.Server.Data
 
         private readonly string _dataDir;
         private readonly string _fullDataDirPrefix;
+        private readonly byte[] _storageKey;
         private readonly ConcurrentDictionary<string, ConversationBucket> _cache
             = new ConcurrentDictionary<string, ConversationBucket>(StringComparer.OrdinalIgnoreCase);
 
-        public MessageStore(string dataDir = null)
+        public MessageStore(string dataDir = null, byte[] storageKey = null)
         {
             _dataDir = dataDir ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ChatData");
+            _storageKey = storageKey;
             if (!Directory.Exists(_dataDir))
                 Directory.CreateDirectory(_dataDir);
 
@@ -33,9 +37,17 @@ namespace ZTalk.Server.Data
         }
 
         /// <summary>
-        /// Lưu 1 tin nhắn (in-memory write-through cache + per-conversation lock + atomic write)
+        /// Lưu 1 tin nhắn (tương thích ngược 5 tham số)
         /// </summary>
         public void SaveMessage(string senderId, string receiverId, string senderName, string content, bool isFile)
+        {
+            SaveMessage(senderId, receiverId, senderName, content, isFile, isEncrypted: false);
+        }
+
+        /// <summary>
+        /// Lưu 1 tin nhắn (in-memory write-through cache + per-conversation lock + optional AEAD encryption-at-rest)
+        /// </summary>
+        public void SaveMessage(string senderId, string receiverId, string senderName, string content, bool isFile, bool isEncrypted)
         {
             var record = new ChatRecord
             {
@@ -43,6 +55,7 @@ namespace ZTalk.Server.Data
                 SenderName = senderName,
                 Content = content,
                 IsFile = isFile,
+                IsEncrypted = isEncrypted,
                 Timestamp = DateTime.UtcNow
             };
 
@@ -158,7 +171,8 @@ namespace ZTalk.Server.Data
 
             try
             {
-                string json = File.ReadAllText(filePath, Encoding.UTF8);
+                string raw = File.ReadAllText(filePath, Encoding.UTF8);
+                string json = StorageCipher.DecryptText(raw, _storageKey);
                 return ZTalk.Shared.Protocol.PacketSerializer.FromJson<List<ChatRecord>>(json) ?? new List<ChatRecord>();
             }
             catch
@@ -179,8 +193,9 @@ namespace ZTalk.Server.Data
             try
             {
                 string json = SerializeHistory(records);
+                string toWrite = StorageCipher.EncryptText(json, _storageKey);
                 string tempPath = filePath + ".tmp";
-                File.WriteAllText(tempPath, json, Encoding.UTF8);
+                File.WriteAllText(tempPath, toWrite, Encoding.UTF8);
 
                 if (File.Exists(filePath))
                     File.Replace(tempPath, filePath, null);
@@ -210,6 +225,7 @@ namespace ZTalk.Server.Data
         public string SenderName { get; set; }
         public string Content { get; set; }
         public bool IsFile { get; set; }
+        public bool IsEncrypted { get; set; }
         public DateTime Timestamp { get; set; }
     }
 }

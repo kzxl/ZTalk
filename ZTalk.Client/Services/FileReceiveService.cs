@@ -4,35 +4,45 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using ZTalk.Shared.Constants;
 
 namespace ZTalk.Client.Services
 {
     /// <summary>
-    /// Nhận file từ sender: tích luỹ chunks → ghép lại → lưu file an toàn trong Downloads.
+    /// Nhận file từ sender bằng disk-streaming (.part) theo offset:
+    /// RAM cố định O(1) bất kể dung lượng file, hỗ trợ ghép chunk đến sai thứ tự,
+    /// chống path traversal và tự dọn file dở dang.
     /// </summary>
-    public class FileReceiveService
+    public class FileReceiveService : IDisposable
     {
         private const int MaxAllowedChunks = 16384; // ~1 GB at 64 KB chunks
         private const long MaxAllowedFileSize = 1024L * 1024L * 1024L;
 
         private readonly string _downloadDir;
+        private readonly string _partDir;
         private readonly string _fullDownloadDirPrefix;
 
-        /// <summary>transferId → thông tin file đang nhận</summary>
+        /// <summary>transferId → phiên nhận file đang stream ra .part</summary>
         private readonly ConcurrentDictionary<string, IncomingFile> _incomingFiles
             = new ConcurrentDictionary<string, IncomingFile>();
 
         /// <summary>Event khi nhận file xong (filePath, senderName)</summary>
         public event Action<string, string> OnFileReceived;
 
-        /// <summary>Event khi nhận chunk (transferId, chunkIndex, totalChunks)</summary>
+        /// <summary>Event khi nhận chunk (transferId, receivedCount, totalChunks)</summary>
         public event Action<string, int, int> OnReceiveProgress;
+
+        public int ActiveTransferCount => _incomingFiles.Count;
 
         public FileReceiveService(string downloadDir = null)
         {
             _downloadDir = downloadDir ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Downloads");
+            _partDir = Path.Combine(_downloadDir, ".part");
+
             if (!Directory.Exists(_downloadDir))
                 Directory.CreateDirectory(_downloadDir);
+            if (!Directory.Exists(_partDir))
+                Directory.CreateDirectory(_partDir);
 
             string fullDir = Path.GetFullPath(_downloadDir);
             _fullDownloadDirPrefix = fullDir.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
@@ -41,7 +51,7 @@ namespace ZTalk.Client.Services
         }
 
         /// <summary>
-        /// Xử lý FileHeader → khởi tạo session nhận file với kiểm tra giới hạn & đường dẫn an toàn
+        /// Xử lý FileHeader → khởi tạo file tạm .part trên đĩa (không giữ chunk trong RAM)
         /// </summary>
         public void HandleFileHeader(string senderId, string senderName, string fileName, long fileSize, int totalChunks, string transferId)
         {
@@ -49,22 +59,47 @@ namespace ZTalk.Client.Services
             if (fileSize < 0 || fileSize > MaxAllowedFileSize) return;
             if (totalChunks < 0 || totalChunks > MaxAllowedChunks) return;
 
-            var incoming = new IncomingFile
-            {
-                SenderId = senderId,
-                SenderName = senderName,
-                FileName = SanitizeFileName(fileName),
-                FileSize = fileSize,
-                TotalChunks = totalChunks,
-                TransferId = transferId,
-                Chunks = new Dictionary<int, byte[]>(Math.Min(totalChunks, 256))
-            };
+            CleanupStaleTransfers(TimeSpan.FromMinutes(30));
 
-            _incomingFiles[transferId] = incoming;
+            string safeTransfer = SanitizeFileName(transferId);
+            string partPath = Path.Combine(_partDir, $"{safeTransfer}_{Guid.NewGuid():N}.part");
+
+            try
+            {
+                var fs = new FileStream(partPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 65536);
+                if (fileSize > 0)
+                    fs.SetLength(fileSize);
+
+                var incoming = new IncomingFile
+                {
+                    SenderId = senderId,
+                    SenderName = senderName,
+                    FileName = SanitizeFileName(fileName),
+                    FileSize = fileSize,
+                    TotalChunks = totalChunks,
+                    TransferId = transferId,
+                    PartFilePath = partPath,
+                    PartStream = fs,
+                    ReceivedChunks = new HashSet<int>(),
+                    LastActivityUtc = DateTime.UtcNow
+                };
+
+                IncomingFile existing;
+                if (_incomingFiles.TryRemove(transferId, out existing))
+                {
+                    existing.AbortAndDelete();
+                }
+                _incomingFiles[transferId] = incoming;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error initializing .part file: {ex.Message}");
+                TryDeleteFile(partPath);
+            }
         }
 
         /// <summary>
-        /// Xử lý FileChunk (Base64) → tích luỹ chunk data
+        /// Xử lý FileChunk (Base64) → giải mã và ghi thẳng xuống đĩa theo offset
         /// </summary>
         public void HandleFileChunk(string transferId, int chunkIndex, string chunkDataBase64)
         {
@@ -83,7 +118,7 @@ namespace ZTalk.Client.Services
         }
 
         /// <summary>
-        /// Xử lý FileChunk (byte[]) → tích luỹ chunk data (hỗ trợ trực tiếp dữ liệu đã giải mã)
+        /// Xử lý FileChunk (byte[]) → seek đúng vị trí (chunkIndex * FileChunkSize) và ghi trực tiếp ra .part
         /// </summary>
         public void HandleFileChunk(string transferId, int chunkIndex, byte[] chunkData)
         {
@@ -100,16 +135,30 @@ namespace ZTalk.Client.Services
             int receivedCount;
             lock (incoming.SyncRoot)
             {
-                incoming.Chunks[chunkIndex] = chunkData;
-                receivedCount = incoming.Chunks.Count;
+                if (incoming.IsClosed || incoming.PartStream == null)
+                    return;
+
+                long offset = (long)chunkIndex * AppConstants.FileChunkSize;
+                if (offset + chunkData.Length > MaxAllowedFileSize)
+                    return;
+
+                incoming.PartStream.Seek(offset, SeekOrigin.Begin);
+                incoming.PartStream.Write(chunkData, 0, chunkData.Length);
+                incoming.ReceivedChunks.Add(chunkIndex);
+                incoming.LastActivityUtc = DateTime.UtcNow;
+
+                long endPos = offset + chunkData.Length;
+                if (endPos > incoming.MaxWrittenLength)
+                    incoming.MaxWrittenLength = endPos;
+
+                receivedCount = incoming.ReceivedChunks.Count;
             }
 
             OnReceiveProgress?.Invoke(transferId, receivedCount, incoming.TotalChunks);
         }
 
         /// <summary>
-        /// Xử lý FileComplete → xác thực đủ chunks → ghép lại → lưu file an toàn
-        /// Returns: đường dẫn file đã lưu, hoặc null nếu lỗi / thiếu chunk
+        /// Xử lý FileComplete → xác thực đủ chunks → đóng .part → di chuyển atomic sang file đích an toàn
         /// </summary>
         public string HandleFileComplete(string transferId)
         {
@@ -124,23 +173,27 @@ namespace ZTalk.Client.Services
             {
                 lock (incoming.SyncRoot)
                 {
-                    if (incoming.TotalChunks > 0 && incoming.Chunks.Count < incoming.TotalChunks)
+                    if (incoming.TotalChunks > 0 && incoming.ReceivedChunks.Count < incoming.TotalChunks)
+                    {
+                        incoming.AbortAndDelete();
                         return null; // Reject incomplete/corrupt transfer
+                    }
+
+                    // Ensure exact length and flush to disk before moving
+                    long finalLen = incoming.FileSize > 0 ? incoming.FileSize : incoming.MaxWrittenLength;
+                    if (incoming.PartStream != null)
+                    {
+                        if (incoming.PartStream.Length != finalLen)
+                            incoming.PartStream.SetLength(finalLen);
+                        incoming.PartStream.Flush();
+                        incoming.PartStream.Dispose();
+                        incoming.PartStream = null;
+                    }
+                    incoming.IsClosed = true;
 
                     string safeName = SanitizeFileName(incoming.FileName);
                     string filePath = BuildUniqueSafePath(safeName);
-
-                    using (var fs = File.Create(filePath))
-                    {
-                        for (int i = 0; i < incoming.TotalChunks; i++)
-                        {
-                            byte[] chunk;
-                            if (!incoming.Chunks.TryGetValue(i, out chunk))
-                                return null;
-
-                            fs.Write(chunk, 0, chunk.Length);
-                        }
-                    }
+                    File.Move(incoming.PartFilePath, filePath);
 
                     OnFileReceived?.Invoke(filePath, incoming.SenderName);
                     return filePath;
@@ -149,8 +202,39 @@ namespace ZTalk.Client.Services
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error completing file transfer: {ex.Message}");
+                incoming.AbortAndDelete();
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Dọn dẹp các phiên nhận file bị bỏ dở quá thời gian maxIdle (xóa file .part tạm)
+        /// </summary>
+        public int CleanupStaleTransfers(TimeSpan maxIdle)
+        {
+            int cleaned = 0;
+            DateTime cutoff = DateTime.UtcNow - maxIdle;
+
+            foreach (var kvp in _incomingFiles)
+            {
+                bool stale;
+                lock (kvp.Value.SyncRoot)
+                {
+                    stale = kvp.Value.LastActivityUtc < cutoff;
+                }
+
+                if (stale)
+                {
+                    IncomingFile removed;
+                    if (_incomingFiles.TryRemove(kvp.Key, out removed))
+                    {
+                        removed.AbortAndDelete();
+                        cleaned++;
+                    }
+                }
+            }
+
+            return cleaned;
         }
 
         private string BuildUniqueSafePath(string safeName)
@@ -199,6 +283,17 @@ namespace ZTalk.Client.Services
             return string.IsNullOrWhiteSpace(sanitized) ? "unnamed_file" : sanitized;
         }
 
+        private static void TryDeleteFile(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch { }
+        }
+
         /// <summary>
         /// Mở file bằng ứng dụng mặc định của hệ thống
         /// </summary>
@@ -231,7 +326,19 @@ namespace ZTalk.Client.Services
             catch { }
         }
 
-        /// <summary>Thông tin 1 file đang nhận</summary>
+        public void Dispose()
+        {
+            foreach (var kvp in _incomingFiles)
+            {
+                IncomingFile removed;
+                if (_incomingFiles.TryRemove(kvp.Key, out removed))
+                {
+                    removed.AbortAndDelete();
+                }
+            }
+        }
+
+        /// <summary>Thông tin 1 file đang stream xuống đĩa .part</summary>
         private sealed class IncomingFile
         {
             public readonly object SyncRoot = new object();
@@ -241,7 +348,23 @@ namespace ZTalk.Client.Services
             public long FileSize;
             public int TotalChunks;
             public string TransferId;
-            public Dictionary<int, byte[]> Chunks;
+            public string PartFilePath;
+            public FileStream PartStream;
+            public HashSet<int> ReceivedChunks;
+            public long MaxWrittenLength;
+            public DateTime LastActivityUtc;
+            public bool IsClosed;
+
+            public void AbortAndDelete()
+            {
+                lock (SyncRoot)
+                {
+                    IsClosed = true;
+                    try { PartStream?.Dispose(); } catch { }
+                    PartStream = null;
+                    TryDeleteFile(PartFilePath);
+                }
+            }
         }
     }
 }

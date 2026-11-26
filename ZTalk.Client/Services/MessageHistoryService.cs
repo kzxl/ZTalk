@@ -2,23 +2,26 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using ZTalk.Shared.Crypto;
 using ZTalk.Shared.Protocol;
 
 namespace ZTalk.Client.Services
 {
     /// <summary>
-    /// Lưu lịch sử tin nhắn local bằng file JSON lines (1 JSON object/dòng).
-    /// Mỗi conversation = 1 file: history_{sanitizedId}.json
+    /// Lưu lịch sử tin nhắn local bằng file JSON lines (được bảo vệ bằng Windows DPAPI CurrentUser).
+    /// Cho phép đọc lại lịch sử E2EE đã giải mã an toàn trên máy nhân viên kể cả sau khi xoay khóa phiên ECDH.
     /// </summary>
     public class MessageHistoryService : IMessageHistoryService
     {
         private readonly string _historyDir;
         private readonly string _fullHistoryDirPrefix;
+        private readonly bool _encryptAtRest;
         private readonly object _ioLock = new object();
 
-        public MessageHistoryService(string historyDir = null)
+        public MessageHistoryService(string historyDir = null, bool encryptAtRest = true)
         {
             _historyDir = historyDir ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ChatHistory");
+            _encryptAtRest = encryptAtRest;
             if (!Directory.Exists(_historyDir))
                 Directory.CreateDirectory(_historyDir);
 
@@ -29,7 +32,7 @@ namespace ZTalk.Client.Services
         }
 
         /// <summary>
-        /// Lưu 1 tin nhắn vào file lịch sử (JSON chuẩn qua PacketSerializer)
+        /// Lưu 1 tin nhắn vào file lịch sử (JSON chuẩn + mã hóa DPAPI CurrentUser trên đĩa)
         /// </summary>
         public void SaveMessage(string conversationId, string senderId, string senderName, string content, bool isFile)
         {
@@ -43,8 +46,10 @@ namespace ZTalk.Client.Services
                 IsFile = isFile
             };
 
-            var line = PacketSerializer.ToJson(item);
-            if (string.IsNullOrEmpty(line)) return;
+            var json = PacketSerializer.ToJson(item);
+            if (string.IsNullOrEmpty(json)) return;
+
+            var line = _encryptAtRest ? StorageCipher.ProtectDpapiLine(json) : json;
 
             try
             {
@@ -60,7 +65,7 @@ namespace ZTalk.Client.Services
         }
 
         /// <summary>
-        /// Lấy lịch sử chat từ file
+        /// Lấy lịch sử chat từ file (tự giải mã DPAPI và tương thích ngược dòng plaintext cũ)
         /// </summary>
         public List<MessageHistoryItem> GetHistory(string conversationId, int limit = 100)
         {
@@ -82,12 +87,17 @@ namespace ZTalk.Client.Services
                 int start = Math.Max(0, lines.Length - limit);
                 for (int i = start; i < lines.Length; i++)
                 {
-                    var line = lines[i];
-                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    var rawLine = lines[i];
+                    if (string.IsNullOrWhiteSpace(rawLine)) continue;
 
-                    var item = PacketSerializer.FromJson<MessageHistoryItem>(line);
-                    if (item != null)
-                        result.Add(item);
+                    try
+                    {
+                        string jsonLine = StorageCipher.UnprotectDpapiLine(rawLine);
+                        var item = PacketSerializer.FromJson<MessageHistoryItem>(jsonLine);
+                        if (item != null)
+                            result.Add(item);
+                    }
+                    catch { }
                 }
             }
             catch (Exception ex)

@@ -20,6 +20,13 @@ namespace ZTalk.Server.Services
             _log = log;
         }
 
+        public bool IsClientOnline(string userId)
+        {
+            if (string.IsNullOrEmpty(userId)) return false;
+            ConnectedClient client;
+            return _clients.TryGetValue(userId, out client) && client.IsAuthenticated;
+        }
+
         /// <summary>
         /// Sends packet to a specific client (serialized per client socket)
         /// </summary>

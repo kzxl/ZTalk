@@ -41,6 +41,7 @@
     <Compile Include="Crypto\DiffieHellmanHelper.cs" />
     <Compile Include="Crypto\ICryptoService.cs" />
     <Compile Include="Crypto\PasswordHasher.cs" />
+    <Compile Include="Crypto\StorageCipher.cs" />
     <Compile Include="DTOs\FileTransferDTO.cs" />
     <Compile Include="DTOs\LoginRequestDTO.cs" />
     <Compile Include="DTOs\LoginResponseDTO.cs" />

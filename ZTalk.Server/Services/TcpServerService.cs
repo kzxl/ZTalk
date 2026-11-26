@@ -11,6 +11,7 @@ using ZTalk.Server.Config;
 using ZTalk.Server.Data;
 using ZTalk.Server.Models;
 using ZTalk.Shared.Constants;
+using ZTalk.Shared.Crypto;
 using ZTalk.Shared.DTOs;
 using ZTalk.Shared.Network;
 using ZTalk.Shared.Protocol;
@@ -33,6 +34,7 @@ namespace ZTalk.Server.Services
         private readonly AuthService _authService;
         private readonly MessageRouter _messageRouter;
         private readonly MessageStore _messageStore;
+        private readonly OfflineMessageQueue _offlineQueue;
         private readonly ServerSecurityConfig _config;
         private readonly AuthRateLimiter _rateLimiter;
         private readonly AuditLogger _auditLogger;
@@ -67,7 +69,16 @@ namespace ZTalk.Server.Services
             _connectionsByIp = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             _authService = new AuthService(userStore);
             _messageRouter = new MessageRouter(_clients, msg => OnLog?.Invoke(msg));
-            _messageStore = new MessageStore();
+
+            byte[] storageKey = _config.EnableStorageEncryption
+                ? StorageCipher.LoadOrCreateProtectedKey(_config.ResolveStorageKeyPath())
+                : null;
+
+            _messageStore = new MessageStore(storageKey: storageKey);
+            _offlineQueue = new OfflineMessageQueue(
+                _config.ResolveOfflineQueueDirectory(),
+                storageKey,
+                _config.MaxOfflineMessagesPerUser);
             _rateLimiter = new AuthRateLimiter(_config.MaxFailedLoginAttempts, _config.LockoutMinutes);
             _auditLogger = new AuditLogger(_config.ResolveAuditLogDirectory());
             _tlsCertificate = tlsCertificate;
@@ -502,14 +513,43 @@ namespace ZTalk.Server.Services
                 {
                     try
                     {
-                        await Task.Delay(500, ct).ConfigureAwait(false);
+                        await Task.Delay(350, ct).ConfigureAwait(false);
                         if (!ct.IsCancellationRequested)
+                        {
                             _messageRouter.BroadcastUserList();
+                            DeliverOfflineMessages(client);
+                        }
                     }
                     catch (OperationCanceledException) { }
                 });
                 OnClientListChanged?.Invoke();
             }
+        }
+
+        private void DeliverOfflineMessages(ConnectedClient client)
+        {
+            if (client == null || !client.IsAuthenticated) return;
+
+            var queued = _offlineQueue.DequeueAll(client.UserId);
+            if (queued.Count == 0) return;
+
+            int delivered = 0;
+            foreach (var packet in queued)
+            {
+                try
+                {
+                    client.SendPacket(packet);
+                    delivered++;
+                }
+                catch
+                {
+                    // Re-queue remaining packet if connection drops mid-delivery
+                    _offlineQueue.Enqueue(client.UserId, packet);
+                }
+            }
+
+            Log($"[OFFLINE] Delivered {delivered}/{queued.Count} queued messages to '{client.DisplayName}' ({client.UserId})");
+            _auditLogger.Write("OFFLINE_DELIVERED", $"userId={client.UserId} count={delivered}");
         }
 
         /// <summary>
@@ -560,9 +600,15 @@ namespace ZTalk.Server.Services
             {
                 _messageRouter.Broadcast(packet, sender.UserId);
             }
-            else
+            else if (_messageRouter.IsClientOnline(packet.ReceiverId))
             {
                 _messageRouter.SendToClient(packet.ReceiverId, packet);
+            }
+            else if (packet.Type == PacketType.Message)
+            {
+                // Recipient is offline -> persist in offline queue for automatic delivery on login
+                _offlineQueue.Enqueue(packet.ReceiverId, packet);
+                Log($"[OFFLINE] Queued message from {sender.UserId} -> {packet.ReceiverId}");
             }
 
             return true;
@@ -645,7 +691,7 @@ namespace ZTalk.Server.Services
                 if (string.IsNullOrEmpty(content)) return;
 
                 string receiverId = packet.Type == PacketType.GroupMessage ? "__group__" : packet.ReceiverId;
-                _messageStore.SaveMessage(sender.UserId, receiverId, sender.DisplayName ?? sender.UserId, content, false);
+                _messageStore.SaveMessage(sender.UserId, receiverId, sender.DisplayName ?? sender.UserId, content, false, msg.IsEncrypted);
             }
         }
 

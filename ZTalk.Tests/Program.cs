@@ -56,6 +56,7 @@ namespace ZTalk.Tests
             RunTest("VoiceCall: Audio Frame Streaming & VAD Silence Suppression", AlgorithmTests.RunVoiceCallSessionTests);
             RunTest("Security Core: AEAD HMAC, PBKDF2, Rate Limiter, Audit Log & TLS 1.2 Pinning", SecurityTests.RunAll);
             RunTest("External Pipeline: Zero-Trust Reverse Tunnel, LAN->WAN Failover & Auto-Reconnect", PipelineTests.RunAll);
+            RunTest("Enterprise 100-User: Disk-Stream .part, Offline Queue, AEAD At-Rest & DPAPI History", EnterpriseTests.RunAll);
 
             Console.WriteLine("--------------------------------------------------");
             Console.WriteLine($"Summary: {passed} passed, {failed} failed.");

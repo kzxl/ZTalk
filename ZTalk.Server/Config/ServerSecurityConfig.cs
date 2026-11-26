@@ -61,6 +61,20 @@ namespace ZTalk.Server.Config
         /// <summary>Directory for rotating security audit log files.</summary>
         public string AuditLogDirectory { get; set; } = "Logs";
 
+        // === Storage Encryption-at-Rest & Offline Message Queue ===
+
+        /// <summary>Encrypt MessageStore and OfflineMessageQueue on disk using AEAD (DPAPI-protected key).</summary>
+        public bool EnableStorageEncryption { get; set; } = false;
+
+        /// <summary>Path to DPAPI-protected 256-bit storage encryption key.</summary>
+        public string StorageKeyPath { get; set; } = @"certs\storage.key";
+
+        /// <summary>Directory for persistent offline message queues.</summary>
+        public string OfflineQueueDirectory { get; set; } = "OfflineQueue";
+
+        /// <summary>Maximum offline messages queued per recipient user.</summary>
+        public int MaxOfflineMessagesPerUser { get; set; } = 500;
+
         // === Zero-Trust Reverse Tunnel (Outbound to Public EdgeRelay VPS) ===
 
         /// <summary>Enable outbound reverse tunnel so external clients reach LAN server with zero open inbound ports.</summary>
@@ -89,6 +103,7 @@ namespace ZTalk.Server.Config
                 AutoGenerateSelfSignedCert = true,
                 AllowPublicRegistration = false,
                 SeedDemoUsers = false,
+                EnableStorageEncryption = true,
                 MaxConnections = 250,
                 MaxConnectionsPerIp = 25,
                 AuthTimeoutSeconds = 10,
@@ -144,6 +159,26 @@ namespace ZTalk.Server.Config
             return Path.IsPathRooted(AuditLogDirectory)
                 ? AuditLogDirectory
                 : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AuditLogDirectory);
+        }
+
+        public string ResolveStorageKeyPath()
+        {
+            if (string.IsNullOrWhiteSpace(StorageKeyPath))
+                return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "certs", "storage.key");
+
+            return Path.IsPathRooted(StorageKeyPath)
+                ? StorageKeyPath
+                : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, StorageKeyPath);
+        }
+
+        public string ResolveOfflineQueueDirectory()
+        {
+            if (string.IsNullOrWhiteSpace(OfflineQueueDirectory))
+                return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "OfflineQueue");
+
+            return Path.IsPathRooted(OfflineQueueDirectory)
+                ? OfflineQueueDirectory
+                : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, OfflineQueueDirectory);
         }
     }
 }

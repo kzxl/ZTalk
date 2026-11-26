@@ -448,15 +448,25 @@ namespace ZTalk.Client.Forms
         private void HandleChatHistoryResponse(Packet packet)
         {
             var payload = PacketSerializer.FromJson<Dictionary<string, object>>(packet.Data);
-            rtbChat.Clear();
-
             if (payload == null)
-            {
-                AppendSystem("No message history");
                 return;
-            }
 
             string partnerId = payload.ContainsKey("PartnerId") ? payload["PartnerId"]?.ToString() : null;
+            bool isGroup = partnerId == "__group__";
+
+            // For 1-1 E2EE chats, local DPAPI history holds decrypted messages across ECDH session rotations.
+            // Only replace UI with server history for Group Chat or when no local history exists.
+            if (!isGroup)
+            {
+                var localItems = _historyService.GetHistory(partnerId, 100);
+                if (localItems.Count > 0)
+                {
+                    RenderLocalHistory(localItems);
+                    return;
+                }
+            }
+
+            rtbChat.Clear();
             var messagesObj = payload.ContainsKey("Messages") ? payload["Messages"] as IEnumerable : null;
             if (messagesObj == null)
             {
@@ -464,17 +474,20 @@ namespace ZTalk.Client.Forms
                 return;
             }
 
-            bool isGroup = partnerId == "__group__";
             int count = 0;
-
             foreach (var entry in messagesObj)
             {
                 var item = entry as Dictionary<string, object>;
                 if (item == null) continue;
 
+                bool isEnc = item.ContainsKey("IsEncrypted") && item["IsEncrypted"] is bool b && b;
                 string senderId = item.ContainsKey("SenderId") ? item["SenderId"]?.ToString() : null;
                 string senderName2 = item.ContainsKey("SenderName") ? item["SenderName"]?.ToString() : null;
                 string content2 = item.ContainsKey("Content") ? item["Content"]?.ToString() : null;
+
+                // Never dump unreadable ciphertext from expired ephemeral ECDH sessions
+                if (isEnc)
+                    content2 = "[🔐 Tin nhắn mã hóa từ phiên trước — chỉ hiển thị trên thiết bị đã gửi/nhận]";
 
                 bool isMine = senderId == _currentUserId;
                 var color = isMine ? Color.LimeGreen : (isGroup ? Color.FromArgb(255, 180, 100) : Color.FromArgb(100, 200, 255));
@@ -488,6 +501,18 @@ namespace ZTalk.Client.Forms
             if (count == 0)
             {
                 AppendSystem("No message history");
+            }
+        }
+
+        private void RenderLocalHistory(List<MessageHistoryItem> items)
+        {
+            rtbChat.Clear();
+            foreach (var item in items)
+            {
+                bool isMine = item.SenderId == _currentUserId;
+                var color = isMine ? Color.LimeGreen : Color.FromArgb(100, 200, 255);
+                var name = isMine ? _currentDisplayName : (item.SenderName ?? item.SenderId ?? "Unknown");
+                AppendChat(name, item.Content ?? "", color);
             }
         }
 
@@ -622,9 +647,17 @@ namespace ZTalk.Client.Forms
                 RefreshUserListBadges(preserveSelection: true);
             }
 
-            // Load chat history from server
-            rtbChat.Clear();
-            AppendSystem("Loading...");
+            // Load local DPAPI-protected E2EE history immediately, then sync server history
+            var localHistory = _historyService.GetHistory(_selectedUserId, 100);
+            if (localHistory.Count > 0)
+            {
+                RenderLocalHistory(localHistory);
+            }
+            else
+            {
+                rtbChat.Clear();
+                AppendSystem("Loading...");
+            }
             var histReq = new Packet(PacketType.ChatHistoryRequest, _currentUserId, _selectedUserId, null);
             _tcpService.SendPacket(histReq);
 
@@ -816,13 +849,14 @@ namespace ZTalk.Client.Forms
             _videoCallService.OnCallEnded -= HandleCallEnded;
             _videoCallService.OnCallRejected -= HandleCallRejected;
 
-            // End video call and release media/UDP resources
+            // End video call and release media/UDP/file-part resources
             if (_videoCallService.IsInCall)
             {
                 _videoCallService.EndCall();
             }
             CloseVideoCallForm();
             _videoCallService.Dispose();
+            _fileReceiveService.Dispose();
 
             // Send disconnect packet
             var packet = new Packet(PacketType.Disconnect, _currentUserId, null, null);

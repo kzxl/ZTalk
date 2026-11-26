@@ -48,6 +48,7 @@
     <Compile Include="AlgorithmTests.cs" />
     <Compile Include="SecurityTests.cs" />
     <Compile Include="PipelineTests.cs" />
+    <Compile Include="EnterpriseTests.cs" />
     <Compile Include="DemoScreenshotGenerator.cs" />
   </ItemGroup>
   <ItemGroup>
