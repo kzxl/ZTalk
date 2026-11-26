@@ -17,12 +17,14 @@ namespace ZTalk.Client.Forms
     {
         private readonly TcpClientService _tcpService;
         private readonly ClientSecurityConfig _securityConfig;
+        private readonly ConnectionPipeline _pipeline;
         private readonly string _autoLoginUser;
         private bool _autoLoginTriggered;
 
         public string LoggedInUserId { get; private set; }
         public string LoggedInDisplayName { get; private set; }
         public TcpClientService TcpService => _tcpService;
+        public ConnectionPipeline Pipeline => _pipeline;
 
         public frmLogin(string autoLoginUser = null)
         {
@@ -30,6 +32,7 @@ namespace ZTalk.Client.Forms
             _autoLoginUser = autoLoginUser;
             _tcpService = new TcpClientService();
             _securityConfig = ClientSecurityConfig.LoadOrDefault();
+            _pipeline = new ConnectionPipeline(_tcpService, _securityConfig);
 
             if (!string.IsNullOrWhiteSpace(_securityConfig.ServerHost))
                 txtServer.Text = _securityConfig.ServerHost;
@@ -109,23 +112,16 @@ namespace ZTalk.Client.Forms
             Action<Packet> handler = null;
             try
             {
-                // 1. Establish TCP/TLS connection
+                // 1. Establish connection via Dual-Endpoint Pipeline (LAN fast probe -> WAN Edge fallback)
                 if (!_tcpService.IsConnected)
                 {
-                    var connected = await _tcpService.ConnectAsync(
-                        txtServer.Text.Trim(),
-                        (int)nudPort.Value,
-                        _securityConfig.UseTls,
-                        _securityConfig.PinnedCertSha256,
-                        _securityConfig.AllowSelfSignedCert,
-                        _securityConfig.TlsTargetHost,
-                        _securityConfig.ConnectTimeoutMs);
+                    var connected = await _pipeline.ConnectSmartAsync(txtServer.Text.Trim(), (int)nudPort.Value);
                     if (IsDisposed || Disposing) return;
 
                     if (!connected)
                     {
                         lblStatus.Text = _securityConfig.UseTls
-                            ? "Cannot establish TLS connection (check server or certificate pin)"
+                            ? "Cannot establish TLS connection (check LAN/WAN server or certificate pin)"
                             : "Cannot connect to server";
                         lblStatus.ForeColor = System.Drawing.Color.Red;
                         return;
@@ -183,6 +179,7 @@ namespace ZTalk.Client.Forms
                 var respDto = PacketSerializer.FromJson<LoginResponseDTO>(response.Data);
                 if (respDto != null && respDto.Success)
                 {
+                    _pipeline.SetSessionCredentials(authPayload.Username, authPayload.PasswordHash);
                     LoggedInUserId = respDto.UserId;
                     LoggedInDisplayName = respDto.DisplayName;
                     this.DialogResult = DialogResult.OK;

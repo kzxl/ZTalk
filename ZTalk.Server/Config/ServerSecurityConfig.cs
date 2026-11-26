@@ -61,6 +61,26 @@ namespace ZTalk.Server.Config
         /// <summary>Directory for rotating security audit log files.</summary>
         public string AuditLogDirectory { get; set; } = "Logs";
 
+        // === Zero-Trust Reverse Tunnel (Outbound to Public EdgeRelay VPS) ===
+
+        /// <summary>Enable outbound reverse tunnel so external clients reach LAN server with zero open inbound ports.</summary>
+        public bool EnableReverseTunnel { get; set; } = false;
+
+        /// <summary>Public EdgeRelay VPS hostname or IP (e.g. chat.congty.vn).</summary>
+        public string EdgeRelayHost { get; set; } = "";
+
+        /// <summary>EdgeRelay TLS control port (default 8443).</summary>
+        public int EdgeRelayControlPort { get; set; } = 8443;
+
+        /// <summary>Shared secret used for HMAC-SHA256 challenge-response tunnel authentication.</summary>
+        public string EdgeRelaySecret { get; set; } = "";
+
+        /// <summary>Pinned SHA-256 thumbprint of the EdgeRelay control TLS certificate.</summary>
+        public string EdgeRelayCertPinSha256 { get; set; } = "";
+
+        /// <summary>Allow self-signed EdgeRelay control certificate without pinning (dev only).</summary>
+        public bool EdgeRelayAllowSelfSigned { get; set; } = false;
+
         public static ServerSecurityConfig CreateEnterpriseDefault()
         {
             return new ServerSecurityConfig

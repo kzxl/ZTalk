@@ -55,6 +55,7 @@ namespace ZTalk.Tests
             RunTest("Algorithm: Radar Sweep Trigonometric Periodic Geometry", AlgorithmTests.RunGeometryTests);
             RunTest("VoiceCall: Audio Frame Streaming & VAD Silence Suppression", AlgorithmTests.RunVoiceCallSessionTests);
             RunTest("Security Core: AEAD HMAC, PBKDF2, Rate Limiter, Audit Log & TLS 1.2 Pinning", SecurityTests.RunAll);
+            RunTest("External Pipeline: Zero-Trust Reverse Tunnel, LAN->WAN Failover & Auto-Reconnect", PipelineTests.RunAll);
 
             Console.WriteLine("--------------------------------------------------");
             Console.WriteLine($"Summary: {passed} passed, {failed} failed.");

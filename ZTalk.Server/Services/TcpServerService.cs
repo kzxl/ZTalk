@@ -36,6 +36,7 @@ namespace ZTalk.Server.Services
         private readonly ServerSecurityConfig _config;
         private readonly AuthRateLimiter _rateLimiter;
         private readonly AuditLogger _auditLogger;
+        private ReverseTunnelAgent _tunnelAgent;
         private X509Certificate2 _tlsCertificate;
         private bool _ownsTlsCertificate;
         private int _connectionCounter;
@@ -48,6 +49,7 @@ namespace ZTalk.Server.Services
         public DateTime? StartTime { get; private set; }
         public bool IsTlsEnabled => _config.EnableTls && _tlsCertificate != null;
         public string ActiveTlsThumbprint { get; private set; }
+        public bool IsReverseTunnelConnected => _tunnelAgent?.IsControlConnected ?? false;
         public ServerSecurityConfig SecurityConfig => _config;
 
         public event Action<string> OnLog;
@@ -99,7 +101,34 @@ namespace ZTalk.Server.Services
 
                 var ct = _cts.Token;
                 Task.Run(() => AcceptClientsAsync(ct));
+
+                StartReverseTunnelIfConfigured(port);
             }
+        }
+
+        private void StartReverseTunnelIfConfigured(int localPort)
+        {
+            if (!_config.EnableReverseTunnel
+                || string.IsNullOrWhiteSpace(_config.EdgeRelayHost)
+                || string.IsNullOrWhiteSpace(_config.EdgeRelaySecret))
+            {
+                return;
+            }
+
+            _tunnelAgent?.Dispose();
+            _tunnelAgent = new ReverseTunnelAgent(
+                _config.EdgeRelayHost,
+                _config.EdgeRelayControlPort,
+                _config.EdgeRelaySecret,
+                "127.0.0.1",
+                localPort,
+                _config.EdgeRelayCertPinSha256,
+                _config.EdgeRelayAllowSelfSigned);
+
+            _tunnelAgent.OnLog += msg => OnLog?.Invoke(msg);
+            _tunnelAgent.OnControlStateChanged += connected =>
+                _auditLogger.Write("TUNNEL_STATE", $"host={_config.EdgeRelayHost}:{_config.EdgeRelayControlPort} connected={connected}");
+            _tunnelAgent.Start();
         }
 
         private void EnsureTlsCertificate()
@@ -142,6 +171,7 @@ namespace ZTalk.Server.Services
         public void Stop()
         {
             CancellationTokenSource ctsToDispose = null;
+            ReverseTunnelAgent tunnelToDispose = null;
             lock (_lifecycleLock)
             {
                 if (!_isRunning) return;
@@ -149,6 +179,8 @@ namespace ZTalk.Server.Services
                 _isRunning = false;
                 ctsToDispose = _cts;
                 _cts = null;
+                tunnelToDispose = _tunnelAgent;
+                _tunnelAgent = null;
 
                 try { ctsToDispose?.Cancel(); } catch { }
 
@@ -166,6 +198,7 @@ namespace ZTalk.Server.Services
                 catch { }
             }
 
+            tunnelToDispose?.Dispose();
             ctsToDispose?.Dispose();
 
             Log("Server stopped");

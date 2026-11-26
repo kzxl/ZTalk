@@ -28,6 +28,12 @@ namespace ZTalk.Server
                     return;
                 }
 
+                if (HasFlag(args, "--edge-relay"))
+                {
+                    RunEdgeRelayServer(args);
+                    return;
+                }
+
                 if (HasFlag(args, "--headless"))
                 {
                     RunHeadlessServer(args);
@@ -42,6 +48,51 @@ namespace ZTalk.Server
             bool forceTls = args != null && HasFlag(args, "--tls");
 
             Application.Run(new Forms.frmServer(autoStart, forceTls));
+        }
+
+        private static void RunEdgeRelayServer(string[] args)
+        {
+            int publicPort = ParseIntArg(args, "--public-port", 443);
+            int controlPort = ParseIntArg(args, "--control-port", 8443);
+            string secret = GetArgValue(args, "--secret") ?? Environment.GetEnvironmentVariable("ZTALK_TUNNEL_SECRET");
+            if (string.IsNullOrWhiteSpace(secret))
+            {
+                Console.WriteLine("Usage: ZTalk.Server.exe --edge-relay --secret <shared-secret> [--public-port 443] [--control-port 8443] [--cert certs\\edge-control.pfx] [--password \"\"] [--cn edge.congty.vn]");
+                return;
+            }
+
+            string certPath = GetArgValue(args, "--cert")
+                ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "certs", "edge-control.pfx");
+            string certPassword = GetArgValue(args, "--password") ?? "";
+            string cn = GetArgValue(args, "--cn") ?? "ZTalk-EdgeRelay";
+
+            var cert = File.Exists(certPath)
+                ? TlsHelper.LoadCertificate(certPath, certPassword)
+                : TlsHelper.GenerateAndSaveSelfSignedPfx(certPath, certPassword, cn);
+
+            using (var relay = new EdgeRelayServer(publicPort, controlPort, secret, cert, ownsCert: true))
+            using (var shutdownSignal = new ManualResetEventSlim(false))
+            {
+                relay.OnLog += msg => Console.WriteLine(msg);
+                Console.CancelKeyPress += (s, e) =>
+                {
+                    e.Cancel = true;
+                    shutdownSignal.Set();
+                };
+                AppDomain.CurrentDomain.ProcessExit += (s, e) => shutdownSignal.Set();
+
+                relay.Start();
+                shutdownSignal.Wait();
+                relay.Stop();
+            }
+        }
+
+        private static int ParseIntArg(string[] args, string flag, int defaultValue)
+        {
+            int parsed;
+            return int.TryParse(GetArgValue(args, flag), out parsed) && parsed > 0 && parsed <= 65535
+                ? parsed
+                : defaultValue;
         }
 
         private static void RunHeadlessServer(string[] args)

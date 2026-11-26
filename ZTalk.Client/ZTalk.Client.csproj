@@ -64,6 +64,7 @@
       <DependentUpon>frmImagePreview.cs</DependentUpon>
     </Compile>
     <Compile Include="Config\ClientSecurityConfig.cs" />
+    <Compile Include="Services\ConnectionPipeline.cs" />
     <Compile Include="Services\ITcpClientService.cs" />
     <Compile Include="Services\TcpClientService.cs" />
     <Compile Include="Services\IChatService.cs" />

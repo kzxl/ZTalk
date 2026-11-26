@@ -52,6 +52,9 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Network\StunClient.cs" />
     <Compile Include="Network\TlsHelper.cs" />
+    <Compile Include="Network\ReverseTunnelProtocol.cs" />
+    <Compile Include="Network\EdgeRelayServer.cs" />
+    <Compile Include="Network\ReverseTunnelAgent.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

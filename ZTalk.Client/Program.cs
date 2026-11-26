@@ -20,14 +20,16 @@ namespace ZTalk.Client
 
                 if (result == DialogResult.OK)
                 {
-                    // 2. Đăng nhập thành công → mở form chat
+                    // 2. Đăng nhập thành công → mở form chat với ConnectionPipeline (LAN/WAN + Auto-Reconnect)
                     Application.Run(new Forms.frmChat(
                         loginForm.TcpService,
                         loginForm.LoggedInUserId,
-                        loginForm.LoggedInDisplayName));
+                        loginForm.LoggedInDisplayName,
+                        loginForm.Pipeline));
                 }
                 else
                 {
+                    loginForm.Pipeline?.Dispose();
                     loginForm.TcpService?.Dispose();
                 }
             }

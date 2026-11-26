@@ -20,6 +20,7 @@ namespace ZTalk.Client.Forms
         private const int MaxChatChars = 100000;
 
         private readonly TcpClientService _tcpService;
+        private readonly ConnectionPipeline _pipeline;
         private readonly ChatService _chatService;
         private readonly FileTransferService _fileTransferService;
         private readonly FileReceiveService _fileReceiveService;
@@ -62,11 +63,12 @@ namespace ZTalk.Client.Forms
             "🙏", "🚀", "💡", "💯", "✨", "☕"
         };
 
-        public frmChat(TcpClientService tcpService, string userId, string displayName)
+        public frmChat(TcpClientService tcpService, string userId, string displayName, ConnectionPipeline pipeline = null)
         {
             InitializeComponent();
 
             _tcpService = tcpService;
+            _pipeline = pipeline;
             _currentUserId = userId;
             _currentDisplayName = displayName;
 
@@ -100,6 +102,16 @@ namespace ZTalk.Client.Forms
             // Subscribe packet handler
             _tcpService.OnPacketReceived += HandlePacket;
             _tcpService.OnDisconnected += HandleDisconnected;
+
+            // Enable resilient LAN/WAN auto-reconnect pipeline when provided
+            if (_pipeline != null)
+            {
+                _pipeline.OnReconnecting += HandlePipelineReconnecting;
+                _pipeline.OnReconnected += HandlePipelineReconnected;
+                _pipeline.OnReconnectFailed += HandlePipelineReconnectFailed;
+                _pipeline.EnableAutoReconnect();
+                this.Text = $"ZTalk - {displayName} [{_pipeline.ActiveEndpointLabel}]";
+            }
 
             // Video call events
             _videoCallService.OnIncomingCall += HandleIncomingCall;
@@ -537,8 +549,45 @@ namespace ZTalk.Client.Forms
                     CloseVideoCallForm();
                 }
 
-                AppendSystem("⚠️ Connection to server lost!");
-                MessageBox.Show("Connection to server lost!", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                if (_pipeline != null && _pipeline.IsAutoReconnectEnabled)
+                {
+                    AppendSystem("⚠️ Mất kết nối máy chủ — đang tự động kết nối lại...");
+                    this.Text = $"ZTalk - {_currentDisplayName} [Reconnecting...]";
+                }
+                else
+                {
+                    AppendSystem("⚠️ Connection to server lost!");
+                    MessageBox.Show("Connection to server lost!", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            });
+        }
+
+        private void HandlePipelineReconnecting(int attempt, int delayMs)
+        {
+            MarshalToUi(() =>
+            {
+                AppendSystem($"🔄 Đang thử kết nối lại lần #{attempt} (sau {delayMs / 1000.0:F1}s)...");
+            });
+        }
+
+        private void HandlePipelineReconnected(string endpointLabel)
+        {
+            MarshalToUi(() =>
+            {
+                this.Text = $"ZTalk - {_currentDisplayName} [{endpointLabel}]";
+                AppendSystem($"✅ Đã kết nối lại thành công qua {endpointLabel}");
+                var heartbeat = new Packet(PacketType.Heartbeat, _currentUserId, null, null);
+                _tcpService.SendPacket(heartbeat);
+            });
+        }
+
+        private void HandlePipelineReconnectFailed(string reason)
+        {
+            MarshalToUi(() =>
+            {
+                this.Text = $"ZTalk - {_currentDisplayName} [Disconnected]";
+                AppendSystem($"❌ Không thể tự động kết nối lại: {reason}");
+                MessageBox.Show($"Không thể kết nối lại: {reason}", "Mất kết nối", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             });
         }
 
@@ -751,6 +800,14 @@ namespace ZTalk.Client.Forms
 
         private void frmChat_FormClosing(object sender, FormClosingEventArgs e)
         {
+            if (_pipeline != null)
+            {
+                _pipeline.OnReconnecting -= HandlePipelineReconnecting;
+                _pipeline.OnReconnected -= HandlePipelineReconnected;
+                _pipeline.OnReconnectFailed -= HandlePipelineReconnectFailed;
+                _pipeline.Dispose();
+            }
+
             _tcpService.OnPacketReceived -= HandlePacket;
             _tcpService.OnDisconnected -= HandleDisconnected;
 
