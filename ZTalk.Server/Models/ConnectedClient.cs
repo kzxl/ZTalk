@@ -1,4 +1,6 @@
 ﻿using System;
+using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using ZTalk.Shared.Protocol;
@@ -6,7 +8,7 @@ using ZTalk.Shared.Protocol;
 namespace ZTalk.Server.Models
 {
     /// <summary>
-    /// Đại diện cho 1 client đang kết nối đến server
+    /// Đại diện cho 1 client đang kết nối đến server (hỗ trợ cả NetworkStream và SslStream TLS)
     /// </summary>
     public class ConnectedClient
     {
@@ -19,8 +21,14 @@ namespace ZTalk.Server.Models
         /// <summary>TCP client socket</summary>
         public TcpClient TcpClient { get; set; }
 
-        /// <summary>Network stream cho TCP</summary>
-        public NetworkStream Stream { get; set; }
+        /// <summary>Active stream (SslStream when TLS enabled, otherwise NetworkStream)</summary>
+        public Stream Stream { get; set; }
+
+        /// <summary>True if connection is secured with TLS 1.2</summary>
+        public bool IsTls { get; set; }
+
+        /// <summary>Remote IP address (cached on accept for per-IP rate limiting)</summary>
+        public string RemoteIp { get; set; }
 
         /// <summary>User ID sau khi authenticate</summary>
         public string UserId { get; set; }
@@ -86,16 +94,27 @@ namespace ZTalk.Server.Models
             Interlocked.Increment(ref _packetsSent);
         }
 
-        /// <summary>Cache RemoteEndPoint once at accept time to avoid repeated socket queries.</summary>
+        /// <summary>Cache RemoteEndPoint and RemoteIp once at accept time to avoid repeated socket queries.</summary>
         public void CacheEndPoint()
         {
             try
             {
-                _cachedEndPoint = TcpClient?.Client?.RemoteEndPoint?.ToString() ?? "Unknown";
+                var remote = TcpClient?.Client?.RemoteEndPoint as IPEndPoint;
+                if (remote != null)
+                {
+                    _cachedEndPoint = remote.ToString();
+                    RemoteIp = remote.Address.ToString();
+                }
+                else
+                {
+                    _cachedEndPoint = TcpClient?.Client?.RemoteEndPoint?.ToString() ?? "Unknown";
+                    RemoteIp = "unknown";
+                }
             }
             catch
             {
                 _cachedEndPoint = "Disconnected";
+                RemoteIp = "unknown";
             }
         }
 

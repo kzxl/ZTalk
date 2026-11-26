@@ -97,9 +97,9 @@ namespace ZTalk.Shared.Protocol
         }
 
         /// <summary>
-        /// Write a pre-framed packet buffer to NetworkStream in a single write call.
+        /// Write a pre-framed packet buffer to Stream (NetworkStream or SslStream) in a single write call.
         /// </summary>
-        public static void SendRawFrame(NetworkStream stream, byte[] frame)
+        public static void SendRawFrame(Stream stream, byte[] frame)
         {
             if (stream == null) throw new ArgumentNullException(nameof(stream));
             if (frame == null || frame.Length < 4) throw new ArgumentException("Invalid frame buffer.", nameof(frame));
@@ -108,26 +108,26 @@ namespace ZTalk.Shared.Protocol
         }
 
         /// <summary>
-        /// Gửi packet qua NetworkStream (length-prefixed, single buffer write)
+        /// Gửi packet qua Stream (length-prefixed, single buffer write)
         /// </summary>
-        public static void SendPacket(NetworkStream stream, Packet packet)
+        public static void SendPacket(Stream stream, Packet packet)
         {
             var frame = FramePacket(packet);
             SendRawFrame(stream, frame);
         }
 
         /// <summary>
-        /// Đọc packet từ NetworkStream (length-prefixed, synchronous)
+        /// Đọc packet từ Stream (length-prefixed, synchronous)
         /// </summary>
-        public static Packet ReceivePacket(NetworkStream stream)
+        public static Packet ReceivePacket(Stream stream)
         {
             return ReceivePacket(stream, AppConstants.MaxPacketSize);
         }
 
         /// <summary>
-        /// Đọc packet từ NetworkStream với giới hạn kích thước tùy chỉnh
+        /// Đọc packet từ Stream với giới hạn kích thước tùy chỉnh
         /// </summary>
-        public static Packet ReceivePacket(NetworkStream stream, int maxPacketSize)
+        public static Packet ReceivePacket(Stream stream, int maxPacketSize)
         {
             var lengthBytes = new byte[4];
             if (!ReadExact(stream, lengthBytes, 4))
@@ -146,10 +146,10 @@ namespace ZTalk.Shared.Protocol
         }
 
         /// <summary>
-        /// Đọc packet bất đồng bộ qua IOCP (tránh chiếm ThreadPool thread khi idle)
+        /// Đọc packet bất đồng bộ qua IOCP (hỗ trợ cả NetworkStream và SslStream)
         /// </summary>
         public static async Task<Packet> ReceivePacketAsync(
-            NetworkStream stream,
+            Stream stream,
             CancellationToken ct = default(CancellationToken),
             int maxPacketSize = AppConstants.MaxPacketSize)
         {

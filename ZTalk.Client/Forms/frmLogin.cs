@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using ZTalk.Client.Config;
 using ZTalk.Client.Services;
 using ZTalk.Shared.DTOs;
 using ZTalk.Shared.Protocol;
@@ -10,11 +11,12 @@ using ZTalk.Shared.Protocol;
 namespace ZTalk.Client.Forms
 {
     /// <summary>
-    /// Login and registration form with 1-click quick demo authentication.
+    /// Login and registration form with TLS 1.2 pinning support and optional enterprise config.
     /// </summary>
     public partial class frmLogin : Form
     {
         private readonly TcpClientService _tcpService;
+        private readonly ClientSecurityConfig _securityConfig;
         private readonly string _autoLoginUser;
         private bool _autoLoginTriggered;
 
@@ -27,6 +29,14 @@ namespace ZTalk.Client.Forms
             InitializeComponent();
             _autoLoginUser = autoLoginUser;
             _tcpService = new TcpClientService();
+            _securityConfig = ClientSecurityConfig.LoadOrDefault();
+
+            if (!string.IsNullOrWhiteSpace(_securityConfig.ServerHost))
+                txtServer.Text = _securityConfig.ServerHost;
+            if (_securityConfig.ServerPort > 0 && _securityConfig.ServerPort <= 65535)
+                nudPort.Value = _securityConfig.ServerPort;
+            if (_securityConfig.HideDemoAccounts)
+                pnlDemo.Visible = false;
         }
 
         protected override void OnShown(EventArgs e)
@@ -99,15 +109,24 @@ namespace ZTalk.Client.Forms
             Action<Packet> handler = null;
             try
             {
-                // 1. Establish TCP connection
+                // 1. Establish TCP/TLS connection
                 if (!_tcpService.IsConnected)
                 {
-                    var connected = await _tcpService.ConnectAsync(txtServer.Text, (int)nudPort.Value);
+                    var connected = await _tcpService.ConnectAsync(
+                        txtServer.Text.Trim(),
+                        (int)nudPort.Value,
+                        _securityConfig.UseTls,
+                        _securityConfig.PinnedCertSha256,
+                        _securityConfig.AllowSelfSignedCert,
+                        _securityConfig.TlsTargetHost,
+                        _securityConfig.ConnectTimeoutMs);
                     if (IsDisposed || Disposing) return;
 
                     if (!connected)
                     {
-                        lblStatus.Text = "Cannot connect to server";
+                        lblStatus.Text = _securityConfig.UseTls
+                            ? "Cannot establish TLS connection (check server or certificate pin)"
+                            : "Cannot connect to server";
                         lblStatus.ForeColor = System.Drawing.Color.Red;
                         return;
                     }

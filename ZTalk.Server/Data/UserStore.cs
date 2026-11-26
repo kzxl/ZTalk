@@ -4,27 +4,32 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using ZTalk.Server.Models;
+using ZTalk.Shared.Crypto;
 
 namespace ZTalk.Server.Data
 {
     /// <summary>
-    /// Lưu trữ user accounts trên server với O(1) dictionary index và atomic persistence.
+    /// Lưu trữ user accounts trên server với O(1) dictionary index,
+    /// PBKDF2-HMAC-SHA256 có per-user salt và atomic persistence.
     /// </summary>
     public class UserStore
     {
         private readonly string _filePath;
+        private readonly bool _seedDemoUsers;
         private List<UserAccount> _users;
         private Dictionary<string, UserAccount> _usersByUsername;
         private readonly object _lock = new object();
 
-        public UserStore(string filePath = null)
+        public UserStore(string filePath = null, bool seedDemoUsers = true)
         {
             _filePath = filePath ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "users.json");
+            _seedDemoUsers = seedDemoUsers;
             LoadUsers();
         }
 
         /// <summary>
-        /// Xác thực user bằng username và password hash (O(1) lookup + constant-time compare)
+        /// Xác thực user bằng username và credential (O(1) lookup + PBKDF2 constant-time verify).
+        /// Tự động nâng cấp hash SHA-256 cũ lên PBKDF2-SHA256 có salt khi đăng nhập thành công.
         /// </summary>
         public UserAccount Authenticate(string username, string passwordHash)
         {
@@ -35,8 +40,14 @@ namespace ZTalk.Server.Data
             {
                 UserAccount user;
                 if (_usersByUsername.TryGetValue(username, out user) &&
-                    FixedTimeEquals(user.PasswordHash, passwordHash))
+                    PasswordHasher.Verify(passwordHash, user.PasswordHash))
                 {
+                    // Transparently migrate legacy unsalted SHA-256 hash to salted PBKDF2-SHA256
+                    if (PasswordHasher.NeedsRehash(user.PasswordHash))
+                    {
+                        user.PasswordHash = PasswordHasher.Hash(passwordHash);
+                        SaveUsers();
+                    }
                     return user;
                 }
                 return null;
@@ -44,7 +55,7 @@ namespace ZTalk.Server.Data
         }
 
         /// <summary>
-        /// Đăng ký user mới
+        /// Đăng ký user mới (băm PBKDF2-SHA256 có CSPRNG salt trước khi lưu đĩa)
         /// </summary>
         public bool Register(string username, string passwordHash, string displayName)
         {
@@ -61,7 +72,7 @@ namespace ZTalk.Server.Data
                 {
                     UserId = Guid.NewGuid().ToString("N").Substring(0, 8),
                     Username = username,
-                    PasswordHash = passwordHash,
+                    PasswordHash = PasswordHasher.Hash(passwordHash),
                     DisplayName = displayName ?? username,
                     CreatedAt = DateTime.Now
                 };
@@ -70,6 +81,45 @@ namespace ZTalk.Server.Data
                 _usersByUsername[username] = user;
                 SaveUsers();
                 return true;
+            }
+        }
+
+        /// <summary>
+        /// Provision hoặc reset tài khoản bởi quản trị viên (nhận raw password, tự băm chuẩn client+PBKDF2)
+        /// </summary>
+        public UserAccount ProvisionAccount(string username, string rawPassword, string displayName)
+        {
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrEmpty(rawPassword))
+                throw new ArgumentException("Username and password are required.");
+
+            string clientDigest = HashPassword(rawPassword);
+            string storedPbkdf2 = PasswordHasher.Hash(clientDigest);
+
+            lock (_lock)
+            {
+                UserAccount user;
+                if (_usersByUsername.TryGetValue(username, out user))
+                {
+                    user.PasswordHash = storedPbkdf2;
+                    if (!string.IsNullOrWhiteSpace(displayName))
+                        user.DisplayName = displayName;
+                }
+                else
+                {
+                    user = new UserAccount
+                    {
+                        UserId = "u_" + Guid.NewGuid().ToString("N").Substring(0, 8),
+                        Username = username.Trim(),
+                        PasswordHash = storedPbkdf2,
+                        DisplayName = string.IsNullOrWhiteSpace(displayName) ? username.Trim() : displayName.Trim(),
+                        CreatedAt = DateTime.Now
+                    };
+                    _users.Add(user);
+                    _usersByUsername[user.Username] = user;
+                }
+
+                SaveUsers();
+                return user;
             }
         }
 
@@ -88,7 +138,7 @@ namespace ZTalk.Server.Data
         }
 
         /// <summary>
-        /// Hash password bằng SHA256
+        /// Client-side SHA256 pre-hash helper (server always wraps with salted PBKDF2-SHA256)
         /// </summary>
         public static string HashPassword(string password)
         {
@@ -97,19 +147,6 @@ namespace ZTalk.Server.Data
                 var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(password));
                 return Convert.ToBase64String(bytes);
             }
-        }
-
-        private static bool FixedTimeEquals(string a, string b)
-        {
-            if (a == null || b == null || a.Length != b.Length)
-                return false;
-
-            int diff = 0;
-            for (int i = 0; i < a.Length; i++)
-            {
-                diff |= a[i] ^ b[i];
-            }
-            return diff == 0;
         }
 
         private void LoadUsers()
@@ -142,8 +179,12 @@ namespace ZTalk.Server.Data
                 }
             }
 
-            // Ensure default demo accounts (alice, bob, charlie) exist with password "123"
-            bool modified = EnsureDemoUsers();
+            bool modified = false;
+            if (_seedDemoUsers)
+            {
+                modified = EnsureDemoUsers();
+            }
+
             if (modified || !fileExisted)
             {
                 SaveUsers();
@@ -161,7 +202,7 @@ namespace ZTalk.Server.Data
 
         private bool EnsureUser(string id, string username, string password, string displayName)
         {
-            string expectedHash = HashPassword(password);
+            string clientDigest = HashPassword(password);
             UserAccount user;
             if (!_usersByUsername.TryGetValue(username, out user))
             {
@@ -169,7 +210,7 @@ namespace ZTalk.Server.Data
                 {
                     UserId = id,
                     Username = username,
-                    PasswordHash = expectedHash,
+                    PasswordHash = PasswordHasher.Hash(clientDigest),
                     DisplayName = displayName,
                     CreatedAt = DateTime.Now
                 };
@@ -179,9 +220,9 @@ namespace ZTalk.Server.Data
             }
 
             bool changed = false;
-            if (user.PasswordHash != expectedHash)
+            if (!PasswordHasher.Verify(clientDigest, user.PasswordHash) || PasswordHasher.NeedsRehash(user.PasswordHash))
             {
-                user.PasswordHash = expectedHash;
+                user.PasswordHash = PasswordHasher.Hash(clientDigest);
                 changed = true;
             }
             if (string.IsNullOrEmpty(user.DisplayName))
@@ -196,6 +237,10 @@ namespace ZTalk.Server.Data
         {
             try
             {
+                string dir = Path.GetDirectoryName(Path.GetFullPath(_filePath));
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
                 var json = ZTalk.Shared.Protocol.PacketSerializer.ToJson(_users);
                 string tempPath = _filePath + ".tmp";
                 File.WriteAllText(tempPath, json, Encoding.UTF8);

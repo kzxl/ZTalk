@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using ZTalk.Server.Config;
 using ZTalk.Server.Data;
 using ZTalk.Server.Services;
 using ZTalk.Shared.Network;
@@ -16,17 +17,22 @@ namespace ZTalk.Server.Forms
     {
         private const int MaxLogChars = 60000;
 
+        private readonly ServerSecurityConfig _securityConfig;
         private readonly TcpServerService _serverService;
         private readonly UserStore _userStore;
         private readonly bool _autoStart;
         private readonly string _cachedLocalIp;
 
-        public frmServer(bool autoStart = false)
+        public frmServer(bool autoStart = false, bool forceTls = false)
         {
             InitializeComponent();
             _autoStart = autoStart;
-            _userStore = new UserStore();
-            _serverService = new TcpServerService(_userStore);
+            _securityConfig = ServerSecurityConfig.LoadOrDefault(enterpriseDefault: false);
+            if (forceTls)
+                _securityConfig.EnableTls = true;
+
+            _userStore = new UserStore(seedDemoUsers: _securityConfig.SeedDemoUsers);
+            _serverService = new TcpServerService(_userStore, _securityConfig);
 
             // Subscribe events
             _serverService.OnLog += AppendLog;
@@ -34,7 +40,11 @@ namespace ZTalk.Server.Forms
 
             // Cache local IP once instead of creating a UDP socket every second in tmrStats_Tick
             _cachedLocalIp = StunClient.GetLocalIPAddress()?.ToString() ?? "127.0.0.1";
-            lblStats.Text = $"⏱ Uptime: --:--:-- | 📦 Routed Packets: 0 | 🌐 Local IP: {_cachedLocalIp}:{(int)nudPort.Value}";
+            if (_securityConfig.Port > 0 && _securityConfig.Port <= 65535)
+                nudPort.Value = _securityConfig.Port;
+
+            string tlsTag = _securityConfig.EnableTls ? "🔒 TLS" : "🔓 Plain";
+            lblStats.Text = $"⏱ Uptime: --:--:-- | 📦 Routed Packets: 0 | {tlsTag} | 🌐 Local IP: {_cachedLocalIp}:{(int)nudPort.Value}";
         }
 
         protected override void OnShown(EventArgs e)

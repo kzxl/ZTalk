@@ -45,8 +45,11 @@
     <Compile Include="Forms\frmServer.Designer.cs">
       <DependentUpon>frmServer.cs</DependentUpon>
     </Compile>
+    <Compile Include="Config\ServerSecurityConfig.cs" />
     <Compile Include="Services\IAuthService.cs" />
     <Compile Include="Services\AuthService.cs" />
+    <Compile Include="Services\AuthRateLimiter.cs" />
+    <Compile Include="Services\AuditLogger.cs" />
     <Compile Include="Services\ITcpServerService.cs" />
     <Compile Include="Services\TcpServerService.cs" />
     <Compile Include="Services\IMessageRouter.cs" />

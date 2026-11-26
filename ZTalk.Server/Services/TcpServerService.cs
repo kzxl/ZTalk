@@ -1,21 +1,25 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
+using ZTalk.Server.Config;
 using ZTalk.Server.Data;
 using ZTalk.Server.Models;
 using ZTalk.Shared.Constants;
 using ZTalk.Shared.DTOs;
+using ZTalk.Shared.Network;
 using ZTalk.Shared.Protocol;
 
 namespace ZTalk.Server.Services
 {
     /// <summary>
-    /// TCP Server xử lý nhiều client đồng thời.
-    /// Mỗi client kết nối → chạy async I/O (IOCP) qua NetworkStream.ReadAsync.
+    /// Enterprise TCP/TLS 1.2 Server xử lý nhiều client đồng thời qua IOCP.
+    /// Hỗ trợ TLS SslStream, giới hạn kết nối/IP, pre-auth timeout, brute-force rate limiting và Audit Log.
     /// </summary>
     public class TcpServerService : ITcpServerService, IDisposable
     {
@@ -25,9 +29,15 @@ namespace ZTalk.Server.Services
         private CancellationTokenSource _cts;
         private readonly object _lifecycleLock = new object();
         private readonly ConcurrentDictionary<string, ConnectedClient> _clients;
+        private readonly ConcurrentDictionary<string, int> _connectionsByIp;
         private readonly AuthService _authService;
         private readonly MessageRouter _messageRouter;
         private readonly MessageStore _messageStore;
+        private readonly ServerSecurityConfig _config;
+        private readonly AuthRateLimiter _rateLimiter;
+        private readonly AuditLogger _auditLogger;
+        private X509Certificate2 _tlsCertificate;
+        private bool _ownsTlsCertificate;
         private int _connectionCounter;
         private int _totalMessagesRouted;
         private volatile bool _isRunning;
@@ -36,6 +46,9 @@ namespace ZTalk.Server.Services
         public int ConnectedCount => _clients.Count;
         public int TotalMessagesRouted => Volatile.Read(ref _totalMessagesRouted);
         public DateTime? StartTime { get; private set; }
+        public bool IsTlsEnabled => _config.EnableTls && _tlsCertificate != null;
+        public string ActiveTlsThumbprint { get; private set; }
+        public ServerSecurityConfig SecurityConfig => _config;
 
         public event Action<string> OnLog;
         public event Action OnClientListChanged;
@@ -45,22 +58,30 @@ namespace ZTalk.Server.Services
             return new List<ConnectedClient>(_clients.Values);
         }
 
-        public TcpServerService(UserStore userStore)
+        public TcpServerService(UserStore userStore, ServerSecurityConfig config = null, X509Certificate2 tlsCertificate = null)
         {
+            _config = config ?? new ServerSecurityConfig();
             _clients = new ConcurrentDictionary<string, ConnectedClient>();
+            _connectionsByIp = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             _authService = new AuthService(userStore);
             _messageRouter = new MessageRouter(_clients, msg => OnLog?.Invoke(msg));
             _messageStore = new MessageStore();
+            _rateLimiter = new AuthRateLimiter(_config.MaxFailedLoginAttempts, _config.LockoutMinutes);
+            _auditLogger = new AuditLogger(_config.ResolveAuditLogDirectory());
+            _tlsCertificate = tlsCertificate;
+            _ownsTlsCertificate = false;
         }
 
         /// <summary>
-        /// Khởi động server trên port chỉ định
+        /// Khởi động server trên port chỉ định (tự nạp hoặc sinh chứng chỉ TLS nếu EnableTls = true)
         /// </summary>
         public void Start(int port)
         {
             lock (_lifecycleLock)
             {
                 if (_isRunning) return;
+
+                EnsureTlsCertificate();
 
                 _cts?.Dispose();
                 _cts = new CancellationTokenSource();
@@ -70,11 +91,49 @@ namespace ZTalk.Server.Services
                 StartTime = DateTime.Now;
                 Interlocked.Exchange(ref _totalMessagesRouted, 0);
 
-                Log($"Server started on port {port}");
+                string mode = IsTlsEnabled
+                    ? $"TLS 1.2 (SHA-256 Pin: {ActiveTlsThumbprint})"
+                    : "Plain TCP (DEV/LAN)";
+                Log($"Server started on port {port} | Mode: {mode} | PublicRegister: {_config.AllowPublicRegistration}");
+                _auditLogger.Write("SERVER_START", $"port={port} tls={IsTlsEnabled} publicRegister={_config.AllowPublicRegistration} maxConn={_config.MaxConnections}");
 
                 var ct = _cts.Token;
                 Task.Run(() => AcceptClientsAsync(ct));
             }
+        }
+
+        private void EnsureTlsCertificate()
+        {
+            if (!_config.EnableTls)
+            {
+                ActiveTlsThumbprint = null;
+                return;
+            }
+
+            if (_tlsCertificate == null)
+            {
+                string certPath = _config.ResolveCertPath();
+                if (File.Exists(certPath))
+                {
+                    _tlsCertificate = TlsHelper.LoadCertificate(certPath, _config.TlsCertPassword);
+                    _ownsTlsCertificate = true;
+                }
+                else if (_config.AutoGenerateSelfSignedCert)
+                {
+                    _tlsCertificate = TlsHelper.GenerateAndSaveSelfSignedPfx(
+                        certPath,
+                        _config.TlsCertPassword,
+                        _config.TlsSubjectCn);
+                    _ownsTlsCertificate = true;
+                    Log($"[TLS] Generated self-signed certificate at {certPath}");
+                }
+                else
+                {
+                    throw new FileNotFoundException($"TLS enabled but certificate not found: {certPath}", certPath);
+                }
+            }
+
+            ActiveTlsThumbprint = TlsHelper.GetCertSha256Thumbprint(_tlsCertificate);
         }
 
         /// <summary>
@@ -93,12 +152,12 @@ namespace ZTalk.Server.Services
 
                 try { ctsToDispose?.Cancel(); } catch { }
 
-                // Disconnect all clients
                 foreach (var kvp in _clients)
                 {
                     CloseClientQuietly(kvp.Value);
                 }
                 _clients.Clear();
+                _connectionsByIp.Clear();
 
                 try
                 {
@@ -110,11 +169,12 @@ namespace ZTalk.Server.Services
             ctsToDispose?.Dispose();
 
             Log("Server stopped");
+            _auditLogger.Write("SERVER_STOP", "Server stopped cleanly");
             OnClientListChanged?.Invoke();
         }
 
         /// <summary>
-        /// Asynchronously accept new clients
+        /// Asynchronously accept new clients with global & per-IP connection caps
         /// </summary>
         private async Task AcceptClientsAsync(CancellationToken ct)
         {
@@ -125,22 +185,38 @@ namespace ZTalk.Server.Services
                     var tcpClient = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
                     tcpClient.NoDelay = true;
 
-                    var connectionId = "conn_" + Interlocked.Increment(ref _connectionCounter);
-
-                    var client = new ConnectedClient
-                    {
-                        TcpClient = tcpClient,
-                        Stream = tcpClient.GetStream(),
-                        UserId = connectionId
-                    };
+                    var client = new ConnectedClient { TcpClient = tcpClient };
                     client.CacheEndPoint();
+                    string remoteIp = client.RemoteIp ?? "unknown";
 
+                    // Enforce global connection cap
+                    if (_clients.Count >= _config.MaxConnections)
+                    {
+                        Log($"[SECURITY] Rejected connection from {client.EndPoint}: MaxConnections ({_config.MaxConnections}) reached");
+                        _auditLogger.Write("CONN_LIMIT_REJECT", $"ip={remoteIp} reason=max_global");
+                        CloseClientQuietly(client);
+                        continue;
+                    }
+
+                    // Enforce per-IP connection cap
+                    int ipCount = _connectionsByIp.AddOrUpdate(remoteIp, 1, (ipKey, count) => count + 1);
+                    if (ipCount > _config.MaxConnectionsPerIp)
+                    {
+                        DecrementIpCount(remoteIp);
+                        Log($"[SECURITY] Rejected connection from {client.EndPoint}: MaxConnectionsPerIp ({_config.MaxConnectionsPerIp}) exceeded");
+                        _auditLogger.Write("CONN_LIMIT_REJECT", $"ip={remoteIp} reason=max_per_ip");
+                        CloseClientQuietly(client);
+                        continue;
+                    }
+
+                    var connectionId = "conn_" + Interlocked.Increment(ref _connectionCounter);
+                    client.UserId = connectionId;
                     _clients.TryAdd(connectionId, client);
+
                     Log($"[CONNECT] New client connected: {client.EndPoint} (ID: {connectionId})");
                     OnClientListChanged?.Invoke();
 
-                    // Handle client asynchronously using IOCP reads
-                    var _ = Task.Run(() => HandleClientAsync(connectionId, client, ct));
+                    var handleTask = Task.Run(() => HandleClientAsync(connectionId, client, ct));
                 }
                 catch (ObjectDisposedException)
                 {
@@ -155,16 +231,79 @@ namespace ZTalk.Server.Services
         }
 
         /// <summary>
-        /// Xử lý 1 client: đọc packet bất đồng bộ và route
+        /// Xử lý 1 client: TLS handshake (nếu bật) + pre-auth timeout + vòng đọc IOCP
         /// </summary>
         private async Task HandleClientAsync(string connectionId, ConnectedClient client, CancellationToken ct)
         {
             try
             {
+                NetworkStream rawStream = client.TcpClient.GetStream();
+
+                if (IsTlsEnabled)
+                {
+                    try
+                    {
+                        client.Stream = await TlsHelper.AuthenticateAsServerAsync(
+                            rawStream,
+                            _tlsCertificate,
+                            ct,
+                            _config.TlsHandshakeTimeoutMs).ConfigureAwait(false);
+                        client.IsTls = true;
+                    }
+                    catch (Exception tlsEx)
+                    {
+                        Log($"[TLS FAIL] {client.EndPoint}: {tlsEx.Message}");
+                        _auditLogger.Write("TLS_HANDSHAKE_FAIL", $"endpoint={client.EndPoint} error={tlsEx.Message}");
+                        return;
+                    }
+                }
+                else
+                {
+                    client.Stream = rawStream;
+                    client.IsTls = false;
+                }
+
+                DateTime authDeadlineUtc = DateTime.UtcNow.AddSeconds(Math.Max(1, _config.AuthTimeoutSeconds));
+
                 while (!ct.IsCancellationRequested && client.TcpClient != null && client.TcpClient.Connected)
                 {
-                    int maxSize = client.IsAuthenticated ? AppConstants.MaxPacketSize : PreAuthMaxPacketSize;
-                    var packet = await PacketSerializer.ReceivePacketAsync(client.Stream, ct, maxSize).ConfigureAwait(false);
+                    Packet packet;
+                    if (!client.IsAuthenticated)
+                    {
+                        int remainingMs = (int)(authDeadlineUtc - DateTime.UtcNow).TotalMilliseconds;
+                        if (remainingMs <= 0)
+                        {
+                            Log($"[SECURITY] Auth timeout for {client.EndPoint} ({connectionId})");
+                            _auditLogger.Write("AUTH_TIMEOUT", $"endpoint={client.EndPoint} conn={connectionId}");
+                            break;
+                        }
+
+                        using (var authTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                        {
+                            authTimeoutCts.CancelAfter(remainingMs);
+                            try
+                            {
+                                packet = await PacketSerializer.ReceivePacketAsync(
+                                    client.Stream,
+                                    authTimeoutCts.Token,
+                                    PreAuthMaxPacketSize).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                            {
+                                Log($"[SECURITY] Auth timeout for {client.EndPoint} ({connectionId})");
+                                _auditLogger.Write("AUTH_TIMEOUT", $"endpoint={client.EndPoint} conn={connectionId}");
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        packet = await PacketSerializer.ReceivePacketAsync(
+                            client.Stream,
+                            ct,
+                            AppConstants.MaxPacketSize).ConfigureAwait(false);
+                    }
+
                     if (packet == null)
                         break; // Client disconnected or invalid packet
 
@@ -183,7 +322,6 @@ namespace ZTalk.Server.Services
             }
             finally
             {
-                // Remove by active key (UserId after login, connectionId before login)
                 DisconnectClient(client.UserId ?? connectionId, client);
             }
         }
@@ -208,7 +346,6 @@ namespace ZTalk.Server.Services
 
                 case PacketType.Message:
                 case PacketType.GroupMessage:
-                    // Only forward & persist authenticated messages
                     if (HandleForward(client, packet))
                     {
                         SaveMessageToStore(client, packet);
@@ -227,7 +364,6 @@ namespace ZTalk.Server.Services
                 case PacketType.VideoCallEnd:
                 case PacketType.VideoFrame:
                 case PacketType.AudioFrame:
-                    // Forward only (không lưu store)
                     HandleForward(client, packet);
                     break;
 
@@ -236,7 +372,6 @@ namespace ZTalk.Server.Services
                     break;
 
                 case PacketType.Heartbeat:
-                    // Reply with online user list only to requesting client (avoids O(N²) broadcast storm)
                     if (client.IsAuthenticated)
                     {
                         _messageRouter.SendUserListToClient(client);
@@ -256,7 +391,7 @@ namespace ZTalk.Server.Services
         }
 
         /// <summary>
-        /// Xử lý đăng nhập
+        /// Xử lý đăng nhập với rate limiter chống brute-force và audit logging
         /// </summary>
         private void HandleLogin(string connectionId, ConnectedClient client, Packet packet, CancellationToken ct)
         {
@@ -272,19 +407,38 @@ namespace ZTalk.Server.Services
             }
 
             var request = PacketSerializer.FromJson<LoginRequestDTO>(packet.Data) ?? new LoginRequestDTO();
+            string remoteIp = client.RemoteIp ?? "unknown";
+
+            // Rate-limit / lockout check
+            TimeSpan remainingLockout;
+            if (_rateLimiter.IsLockedOut(request.Username, remoteIp, out remainingLockout))
+            {
+                int waitSeconds = Math.Max(1, (int)Math.Ceiling(remainingLockout.TotalSeconds));
+                var lockedResponse = new LoginResponseDTO
+                {
+                    Success = false,
+                    Message = $"Tài khoản hoặc IP tạm khóa do đăng nhập sai nhiều lần. Thử lại sau {waitSeconds}s."
+                };
+                client.SendPacket(new Packet(PacketType.LoginResponse, "server", connectionId, PacketSerializer.ToJson(lockedResponse)));
+                Log($"[SECURITY] Blocked locked login attempt for '{request.Username}' from {remoteIp}");
+                _auditLogger.Write("LOGIN_LOCKED", $"user={request.Username} ip={remoteIp} waitSeconds={waitSeconds}");
+                return;
+            }
+
             var response = _authService.Authenticate(request);
 
             if (response.Success)
             {
-                // Remove temporary connection key
+                _rateLimiter.RecordSuccess(request.Username, remoteIp);
+
                 ConnectedClient removed;
                 _clients.TryRemove(connectionId, out removed);
 
-                // Replace any stale session for the same UserId cleanly
                 ConnectedClient existingSession;
                 if (_clients.TryRemove(response.UserId, out existingSession) && !ReferenceEquals(existingSession, client))
                 {
                     Log($"[LOGIN] Replacing existing session for '{request.Username}' (ID: {response.UserId})");
+                    DecrementIpCount(existingSession.RemoteIp);
                     CloseClientQuietly(existingSession);
                 }
 
@@ -295,21 +449,22 @@ namespace ZTalk.Server.Services
 
                 _clients[response.UserId] = client;
 
-                Log($"[LOGIN] User '{request.Username}' authenticated successfully (ID: {response.UserId})");
+                Log($"[LOGIN] User '{request.Username}' authenticated successfully (ID: {response.UserId}, TLS: {client.IsTls})");
+                _auditLogger.Write("LOGIN_OK", $"user={request.Username} userId={response.UserId} ip={remoteIp} tls={client.IsTls}");
             }
             else
             {
-                Log($"[LOGIN FAILED] {request.Username}: {response.Message}");
+                _rateLimiter.RecordFailure(request.Username, remoteIp);
+                Log($"[LOGIN FAILED] {request.Username} ({remoteIp}): {response.Message}");
+                _auditLogger.Write("LOGIN_FAIL", $"user={request.Username} ip={remoteIp} reason={response.Message}");
             }
 
-            // Send response back to client (thread-safe)
             var responseData = PacketSerializer.ToJson(response);
             var responsePacket = new Packet(PacketType.LoginResponse, "server", connectionId, responseData);
             client.SendPacket(responsePacket);
 
             if (response.Success)
             {
-                // Brief delay to allow client to open frmChat and subscribe to events
                 Task.Run(async () =>
                 {
                     try
@@ -325,18 +480,34 @@ namespace ZTalk.Server.Services
         }
 
         /// <summary>
-        /// Handle registration
+        /// Handle registration (gated by ServerSecurityConfig.AllowPublicRegistration)
         /// </summary>
         private void HandleRegister(string connectionId, ConnectedClient client, Packet packet)
         {
             var request = PacketSerializer.FromJson<LoginRequestDTO>(packet.Data) ?? new LoginRequestDTO();
-            var response = _authService.Register(request);
-            var responseData = PacketSerializer.ToJson(response);
+            string remoteIp = client.RemoteIp ?? "unknown";
 
+            LoginResponseDTO response;
+            if (!_config.AllowPublicRegistration)
+            {
+                response = new LoginResponseDTO
+                {
+                    Success = false,
+                    Message = "Đăng ký tự do đã bị tắt. Vui lòng liên hệ quản trị viên để được cấp tài khoản."
+                };
+                Log($"[SECURITY] Blocked public registration attempt for '{request.Username}' from {remoteIp}");
+                _auditLogger.Write("REGISTER_BLOCKED", $"user={request.Username} ip={remoteIp}");
+            }
+            else
+            {
+                response = _authService.Register(request);
+                Log($"[REGISTER] {request.Username}: {response.Message}");
+                _auditLogger.Write(response.Success ? "REGISTER_OK" : "REGISTER_FAIL", $"user={request.Username} ip={remoteIp}");
+            }
+
+            var responseData = PacketSerializer.ToJson(response);
             var responsePacket = new Packet(PacketType.RegisterResponse, "server", connectionId, responseData);
             client.SendPacket(responsePacket);
-
-            Log($"[REGISTER] {request.Username}: {response.Message}");
         }
 
         /// <summary>
@@ -350,17 +521,14 @@ namespace ZTalk.Server.Services
                 return false;
             }
 
-            // Always overwrite SenderId with authenticated UserId to prevent spoofing
             packet.SenderId = sender.UserId;
 
             if (string.IsNullOrEmpty(packet.ReceiverId))
             {
-                // Broadcast
                 _messageRouter.Broadcast(packet, sender.UserId);
             }
             else
             {
-                // Point-to-point
                 _messageRouter.SendToClient(packet.ReceiverId, packet);
             }
 
@@ -382,7 +550,6 @@ namespace ZTalk.Server.Services
             ConnectedClient client;
             if (expectedClient != null)
             {
-                // Ensure a closing replaced session does not kick the newly logged-in session
                 if (!_clients.TryGetValue(connectionId, out client) || !ReferenceEquals(client, expectedClient))
                 {
                     CloseClientQuietly(expectedClient);
@@ -392,9 +559,11 @@ namespace ZTalk.Server.Services
 
             if (_clients.TryRemove(connectionId, out client))
             {
+                DecrementIpCount(client.RemoteIp);
                 CloseClientQuietly(client);
 
                 Log($"[DISCONNECT] Client disconnected: {client.DisplayName ?? client.Username ?? connectionId}");
+                _auditLogger.Write("DISCONNECT", $"userId={client.UserId} ip={client.RemoteIp}");
 
                 if (client.IsAuthenticated)
                 {
@@ -402,6 +571,18 @@ namespace ZTalk.Server.Services
                 }
 
                 OnClientListChanged?.Invoke();
+            }
+        }
+
+        private void DecrementIpCount(string remoteIp)
+        {
+            if (string.IsNullOrEmpty(remoteIp)) return;
+
+            int newCount = _connectionsByIp.AddOrUpdate(remoteIp, 0, (_, count) => Math.Max(0, count - 1));
+            if (newCount == 0)
+            {
+                int ignored;
+                _connectionsByIp.TryRemove(remoteIp, out ignored);
             }
         }
 
@@ -460,6 +641,12 @@ namespace ZTalk.Server.Services
         public void Dispose()
         {
             Stop();
+            if (_ownsTlsCertificate && _tlsCertificate != null)
+            {
+                _tlsCertificate.Dispose();
+                _tlsCertificate = null;
+            }
+            _auditLogger?.Dispose();
         }
     }
 }
